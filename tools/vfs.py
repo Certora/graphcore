@@ -28,8 +28,7 @@ from langchain_core.tools.base import BaseTool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-
-from graphcore.graph import tool_output
+from ..graph import tool_output
 
 def merge_vfs(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
     new_left = left.copy()

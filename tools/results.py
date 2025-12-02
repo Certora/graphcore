@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, create_model
 from langchain_core.tools import tool, BaseTool, InjectedToolCallId
 from langgraph.types import Command
 from langgraph.prebuilt import InjectedState
-from graphcore.graph import tool_output, tool_return
+from ..graph import tool_output, tool_return
 
 ST = TypeVar("ST")
 R = TypeVar("R")
@@ -26,6 +26,8 @@ M = TypeVar("M", bound=BaseModel)
 
 ValidationResult = Command | str | None
 ResultValidator = tuple[type[ST], Callable[[ST, R, str], ValidationResult]] | Callable[[R, str], ValidationResult]
+
+_magic_state_name = "graphcore_injected_state"
 
 @overload
 def result_tool_generator(
@@ -145,8 +147,6 @@ def result_tool_generator(
     """
     ...
 
-_magic_state_name = "graphcore_injected_state"
-
 def result_tool_generator(
     outkey: str,
     result_schema: type[BaseModel] | tuple[type, str],
@@ -183,7 +183,7 @@ def result_tool_generator(
     if isinstance(result_schema, type) and issubclass(result_schema, BaseModel):
         # Case 1: result_schema is a Pydantic BaseModel
         # Copy all fields from result_schema with their metadata
-        field_definitions = {}
+        field_definitions: dict[str, Any] = {}
         for field_name, field_info in result_schema.model_fields.items():
             field_definitions[field_name] = (field_info.annotation, field_info)
 
