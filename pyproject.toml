@@ -23,6 +23,9 @@ dependencies = [
     "psycopg-binary==3.2.12",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["graphcore*"]
+[tool.setuptools]
+packages = ["graphcore"]
+
+[tool.setuptools.package-dir]
+graphcore = "."
+
