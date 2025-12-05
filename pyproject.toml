@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["graphcore"]
+packages = ["graphcore", "graphcore.tools"]
 
 [tool.setuptools.package-dir]
 graphcore = "."
