@@ -262,8 +262,9 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         file names which contain the query somewhere in their contents. Matching
         file names are output one per line. Empty lines should be ignored.
         When invoked with the argument `matching_line_only` set to `True`, returns
-        a list of pairs of the form `(file_name, matching_line_content)`, i.e.
-        the file names are paired with the content of the entire line matching the query after the filename.
+        pairs of the form `file_name: matching_line_content`, i.e.
+        the file names are paired with the content of the entire line matching
+        the query after the filename.
         """
 
         search_string: str = Field(description="The query string to search for provided as a python regex. Thus, you must escape any special characters (like [, |, etc.)")
@@ -274,14 +275,14 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         state: Annotated[InputType, InjectedState],
         search_string: str,
         matching_line_only: bool
-    ) -> list[tuple[str, str]] | list[str]:
+    ) -> str:
         comp: re.Pattern
         try:
             comp = re.compile(search_string)
         except Exception:
             return "Illegal pattern name, check your syntax and try again."
 
-        matches: list[tuple[str, str]] | list[str] = []
+        matches: list[str] = []
 
         for (k, v) in state["vfs"].items():
             if not get_filter(k):
@@ -290,7 +291,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
             if matching_line_only:
                 for line in v.splitlines():
                     if comp.search(line) is not None:
-                        matches.append((k, line))
+                        matches.append(f"{k}: {line}")
             else:
                 if comp.search(v) is not None:
                     matches.append(k)
@@ -310,13 +311,12 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 if matching_line_only:
                     for line in content.splitlines():
                         if comp.search(line) is not None:
-                            matches.append((rel_name, line))
+                            matches.append(f"{rel_name}: {line}")
                 else:
                     if comp.search(content):
                         matches.append(rel_name)
 
-        return matches
-
+        return "\n".join(matches)
 
     tools: list[BaseTool] = [get_file, list_files, grep_files]
     if not conf["immutable"]:
