@@ -261,14 +261,20 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         Search for a specific string in the files on the VFS. Returns a list of
         file names which contain the query somewhere in their contents. Matching
         file names are output one per line. Empty lines should be ignored.
+        When invoked with the argument `matching_line_only` set to `True`, returns
+        pairs of the form `file_name: matching_line_content`, i.e.
+        the file names are paired with the content of the entire line matching
+        the query after the filename.
         """
 
         search_string: str = Field(description="The query string to search for provided as a python regex. Thus, you must escape any special characters (like [, |, etc.)")
+        matching_line_only: bool = Field(description="Specify whether the content of the line matching the query should be returned with the filename")
 
     @tool(args_schema=GrepFileSchema)
     def grep_files(
         state: Annotated[InputType, InjectedState],
-        search_string: str
+        search_string: str,
+        matching_line_only: bool
     ) -> str:
         comp: re.Pattern
         try:
@@ -281,8 +287,14 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         for (k, v) in state["vfs"].items():
             if not get_filter(k):
                 continue
-            if comp.search(v) is not None:
-                matches.append(k)
+
+            if matching_line_only:
+                for line in v.splitlines():
+                    if comp.search(line) is not None:
+                        matches.append(f"{k}: {line}")
+            else:
+                if comp.search(v) is not None:
+                    matches.append(k)
 
         if (layer := conf.get("fs_layer", None)) is not None:
             p = pathlib.Path(layer)
@@ -294,9 +306,15 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                     continue
                 if rel_name in state["vfs"]:
                     continue
-                if not comp.search(f.read_text()):
-                    continue
-                matches.append(rel_name)
+
+                content = f.read_text()
+                if matching_line_only:
+                    for line in content.splitlines():
+                        if comp.search(line) is not None:
+                            matches.append(f"{rel_name}: {line}")
+                else:
+                    if comp.search(content):
+                        matches.append(rel_name)
 
         return "\n".join(matches)
 
