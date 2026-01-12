@@ -34,7 +34,7 @@ your output in a way that is most suitable for your later consumption.
 
 Your summary should include:
 1. Your current progress on the task, what is done and what remains to be done
-2. Any lessons you have learned from invoking the tools; what CVL syntax you've learned, and what lessons you've learned from verification failures (if any)
+2. Any lessons you have learned from invoking the tools; e.g., what CVL syntax you've learned, and what lessons you've learned from verification failures (if any)
 3. Any lessons you've learned about invoking the various tools; e.g., "using solc8.2 doesn't work because ...". Include any workarounds or advice when invoking the tools
 
 IMPORTANT: your summary must accurately capture the current state of the task. Do NOT include commentary describing past failures, **unless** it is
