@@ -38,10 +38,9 @@ def _process_model_basem(
 ) -> tuple[dict[str, Any], str | None]:
     disc : str | None = None
     fields : dict[str, Any] = {}
-    for (k, v) in t.model_fields:
-        assert isinstance(v, FieldInfo)
+    for (k, v) in t.model_fields.items():
+        assert v.annotation is not None
         ty = v.annotation
-        assert isinstance(ty, type)
         if get_origin(ty) is Literal:
             if k != "type":
                 raise RuntimeError(f"Illegal type annotation: {v} on {k}")
