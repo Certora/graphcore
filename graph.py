@@ -13,7 +13,7 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable
+from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Callable, Generator, Awaitable, Coroutine
 from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
@@ -25,7 +25,7 @@ from langgraph.types import Command
 from langgraph.prebuilt import ToolNode
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel
-from .utils import cached_invoke
+from .utils import cached_invoke, acached_invoke
 from .summary import SummaryConfig
 
 """
@@ -124,54 +124,133 @@ InputState = TypeVar('InputState', bound=FlowInput)
 InputType = TypeVar("InputType", contravariant=True)
 OutputType = TypeVar("OutputType", covariant=True)
 
-class InitNodeFunction(Protocol[InputType, OutputType]):
+class NodeFunction(Protocol[InputType, OutputType]):
     """Protocol defining the signature for LangGraph input functions. All instantiations of InputType
     are expected to be a type bounded above by FlowInput, although this is not expressible."""
     def __call__(self, state: InputType) -> OutputType:
         ...
 
-class ChatNodeFunction(Protocol[InputType]):
-    """
-    The protocol defining the signature for a langgraph node function.
-    Takes a state which contains *at least* some messages (MessagesState), and returns
-    an update to the messages state.
-    """
-    def __call__(self, state: InputType) -> dict[str, List[BaseMessage]]:
+class AsyncNodeFunction(Protocol[InputType, OutputType]):
+    """Protocol defining the signature for LangGraph input functions. All instantiations of InputType
+    are expected to be a type bounded above by FlowInput, although this is not expressible."""
+    def __call__(self, state: InputType) -> Coroutine[Any, Any, OutputType]:
         ...
+
+type ChatNodeFunction[InputType] = NodeFunction[InputType, dict[str, list[BaseMessage]]]
+type AsyncChatNodeFunction[InputType] = AsyncNodeFunction[InputType, dict[str, list[BaseMessage]]]
+type AnyChatNodeFunction[StateT] = AsyncChatNodeFunction[StateT] | ChatNodeFunction[StateT]
+type AnyNodeFunction[InputType, OutputType] = AsyncNodeFunction[InputType, OutputType] | NodeFunction[InputType, OutputType]
+
+
+ResT = TypeVar("ResT")
+
+type PureFunctionGenerator[ResT] = Generator[list[AnyMessage], BaseMessage, ResT]
+type PureFunction[StateT, ResT] = Callable[[StateT], PureFunctionGenerator[ResT]]
+type SyncLLM = Callable[[list[AnyMessage]], BaseMessage]
+type AsyncLLM = Callable[[list[AnyMessage]], Awaitable[BaseMessage]]
+type LLM = Runnable[LanguageModelInput, BaseMessage]
+
 
 # TypeVars for generic typing
 StateT = TypeVar('StateT', bound=MessagesState)
 OutputT = TypeVar('OutputT', bound=StateLike)
 ContextT = TypeVar("ContextT", bound=StateLike)
 
+def _async_llm(
+    llm: LLM
+) -> AsyncLLM:
+    async def impl(
+        s: list[AnyMessage]
+    ) -> BaseMessage:
+        res = await acached_invoke(llm, s)
+        return res
+    return impl
+
+def _sync_llm(
+    llm: LLM
+) -> SyncLLM:
+    return lambda m: cached_invoke(llm, m)
+
+IN = TypeVar("IN")
+OUT = TypeVar("OUT")
+
+def _stitch_sync_impl(
+    pure: PureFunction[IN, OUT],
+    llm_impl: SyncLLM
+) -> NodeFunction[IN, OUT]:
+    def impl(
+        state: IN
+    ) -> OUT:
+        thunk = pure(state)
+        d = next(thunk)
+        res = llm_impl(d)
+        try:
+            thunk.send(res)
+            assert False, "did not terminate"
+        except StopIteration as e:
+            return e.value
+    return impl
+
+def _stitch_async_impl(
+    pure: PureFunction[IN, OUT],
+    llm_impl: AsyncLLM
+) -> AsyncNodeFunction[IN, OUT]:
+    async def impl(
+        state: IN
+    ) -> OUT:
+        thunk = pure(state)
+        d = next(thunk)
+        res = await llm_impl(d)
+        try:
+            thunk.send(res)
+            assert False, "did not terminate"
+        except StopIteration as e:
+            return e.value
+    return impl
+
+def _pure_tool_generator(
+    t: type[StateT]
+) -> PureFunction[StateT, dict[str, list[BaseMessage]]]:
+    def impl(
+        state: MessagesState
+    ) -> PureFunctionGenerator[dict[str, list[BaseMessage]]]:
+        res = yield state["messages"]
+        return {"messages": [res]}
+    return impl
+
 def tool_result_generator(
     t: type[StateT],
     llm: Runnable[LanguageModelInput, BaseMessage],
 ) -> ChatNodeFunction[StateT]:
-    """
-    Create a LangGraph node function that processes tool results by sending
-    the current message history to the LLM for the next response.
+    return _stitch_sync_impl(
+        _pure_tool_generator(t),
+        _sync_llm(llm)
+    )
 
-    Args:
-        llm: The LLM bound with tools to invoke for generating responses
+def async_tool_result_generator(
+    t: type[StateT],
+    llm: LLM
+) -> AsyncChatNodeFunction[StateT]:
+    return _stitch_async_impl(
+        _pure_tool_generator(t),
+        _async_llm(llm)
+    )
 
-    Returns:
-        A node function that takes MessagesState and returns updated messages
-    """
-    def tool_result(state: MessagesState) -> dict[str, List[BaseMessage]]:
-        # logger.debug("Tool result state messages:%s", pretty_print_messages(state["messages"]))
-        result = cached_invoke(llm, state["messages"])
-        return {"messages": [result]}
-    return tool_result
+class _ResultFact(Protocol):
+    def __call__(
+        self,
+        t: type[StateT],
+        llm: LLM
+    ) -> AnyChatNodeFunction[StateT]:
+        ...
 
-def get_summarizer(
-    llm: BaseChatModel,
+def _get_summarizer_pure(
     system_prompt: str,
     initial_prompt: str,
     state_type: type[StateT],
     context: SummaryConfig[StateT]
-) -> ChatNodeFunction[StateT]:
-    def to_return(state: StateT) -> dict[str, list[BaseMessage]]:
+) -> PureFunction:
+    def to_return(state: StateT) -> PureFunctionGenerator:
         config = context
         assert config is not None
 
@@ -181,7 +260,7 @@ def get_summarizer(
         assert len(messages) >= config.max_messages
 
         try:
-            msg = llm.invoke(messages + [HumanMessage(content=summary_prompt)])
+            msg = yield(messages + [HumanMessage(content=summary_prompt)])
             assert isinstance(msg, AIMessage)
             summary = msg.text()
             resume_message = config.get_resume_prompt(state, summary)
@@ -191,38 +270,25 @@ def get_summarizer(
                     RemoveMessage(id="__remove_all__"),
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=initial_prompt),
-                    HumanMessage(content=summary),
                     HumanMessage(content=resume_message),
                 ]
             }
         except Exception:
             return {}
-
     return to_return
 
+I = TypeVar("I", bound=FlowInput)
+O = TypeVar("O")
 
-def initial_node(
-    t: Type[InputState],
-    output_state: Type[StateT],
+def _get_initial_pure(
+    t: Type[I],
+    output_state: Type[O],
     sys_prompt: str,
     initial_prompt: str,
-    llm: Runnable[LanguageModelInput, BaseMessage]
-) -> InitNodeFunction[InputState, StateT]:
-    """
-    Create a LangGraph node function that initializes a workflow with system and human messages,
-    then gets the first LLM response.
-
-    Args:
-        t: unused argument to parameterize over the input state
-        output_state: unused argument to parameterize over the output state
-        sys_prompt: System message content to set the LLM's role and context
-        initial_prompt: Human message template to start the conversation
-        llm: The LLM bound with tools to invoke for generating the initial response
-
-    Returns:
-        A node function that takes an InputState and returns initial message history.
-    """
-    def to_return(state: InputState) -> StateT:
+) -> PureFunction[I, O]:
+    def impl(
+        state: I
+    ) -> PureFunctionGenerator[O]:
         """
         Any fields in state that are not specified by the FlowInput bound (i.e.,
         are not front_matter or input) are automatically added to the main state.
@@ -250,7 +316,7 @@ def initial_node(
         # front_matter is for variable inputs that provide context to the initial prompt
         # (e.g., reference material)
         # this cast is fine because we don't write into initial_messages
-        res = cached_invoke(llm, initial_messages)
+        res = yield initial_messages
 
         initial_messages.append(
             cast(AnyMessage, res)
@@ -260,16 +326,86 @@ def initial_node(
             if k == "front_matter" or k == "input":
                 continue
             to_ret[k] = v
-        return cast(StateT, to_ret)
+        return cast(O, to_ret)
+    return impl
+        
 
-    return to_return
+def get_summarizer(
+    llm: LLM,
+    system_prompt: str,
+    initial_prompt: str,
+    state_type: type[StateT],
+    context: SummaryConfig[StateT]
+) -> ChatNodeFunction[StateT]:
+    return _stitch_sync_impl(
+        pure=_get_summarizer_pure(system_prompt, initial_prompt, state_type, context),
+        llm_impl=_sync_llm(llm)
+    )
+
+def get_async_summarizer(
+    llm: LLM,
+    system_prompt: str,
+    initial_prompt: str,
+    state_type: type[StateT],
+    context: SummaryConfig[StateT]
+) -> AsyncChatNodeFunction[StateT]:
+    return _stitch_async_impl(
+        _get_summarizer_pure(system_prompt, initial_prompt, state_type, context),
+        _async_llm(llm)
+    )
+
+class _SummarizerFact(Protocol):
+    def __call__(
+        self,
+        llm: LLM,
+        system_prompt: str,
+        initial_prompt: str,
+        state_type: type[StateT],
+        context: SummaryConfig[StateT]
+    ) -> AnyChatNodeFunction[StateT]:
+        ...
+
+def initial_node(
+    t: Type[InputState],
+    output_state: Type[StateT],
+    sys_prompt: str,
+    initial_prompt: str,
+    llm: LLM
+) -> NodeFunction[InputState, StateT]:
+    return _stitch_sync_impl(
+        _get_initial_pure(t, output_state, sys_prompt, initial_prompt),
+        _sync_llm(llm)
+    )
+
+def async_initial_node(
+    t: Type[InputState],
+    output_state: Type[StateT],
+    sys_prompt: str,
+    initial_prompt: str,
+    llm: LLM
+) -> AsyncNodeFunction[InputState, StateT]:
+    return _stitch_async_impl(
+        _get_initial_pure(t, output_state, sys_prompt, initial_prompt),
+        _async_llm(llm)
+    )
+
+class _InitialFact(Protocol):
+    def __call__(
+        self,
+        t: Type[InputState],
+        output_state: Type[StateT],
+        sys_prompt: str,
+        initial_prompt: str,
+        llm: LLM
+    ) -> AnyNodeFunction[InputState, StateT]:
+        ...
 
 INITIAL_NODE = "initial"
 TOOLS_NODE = "tools"
 TOOL_RESULT_NODE = "tool_result"
 SUMMARIZE_NODE = "summarize"
 
-BoundLLM = Runnable[LanguageModelInput, BaseMessage]
+BoundLLM = LLM
 
 SplitTool = tuple[dict[str, Any], BaseTool]
 
@@ -284,7 +420,67 @@ def build_workflow(
     output_schema: Optional[Type[OutputT]] = None,
     context_schema: Optional[Type[ContextT]] = None,
     summary_config: SummaryConfig[StateT] | None = None
-) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], BoundLLM]:
+) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
+    return _build_workflow(
+        state_class,
+        input_type,
+        tools_list,
+        sys_prompt,
+        initial_prompt,
+        output_key,
+        unbound_llm,
+        output_schema,
+        context_schema,
+        summary_config,
+        tool_result_generator,
+        initial_node,
+        get_summarizer
+    )
+
+
+def build_async_workflow(
+    state_class: Type[StateT],
+    input_type: Type[InputState],
+    tools_list: Iterable[BaseTool | SplitTool],
+    sys_prompt: str,
+    initial_prompt: str,
+    output_key: str,
+    unbound_llm: BaseChatModel,
+    output_schema: Optional[Type[OutputT]] = None,
+    context_schema: Optional[Type[ContextT]] = None,
+    summary_config: SummaryConfig[StateT] | None = None
+) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
+    return _build_workflow(
+        state_class,
+        input_type,
+        tools_list,
+        sys_prompt,
+        initial_prompt,
+        output_key,
+        unbound_llm,
+        output_schema,
+        context_schema,
+        summary_config,
+        async_tool_result_generator,
+        async_initial_node,
+        get_async_summarizer
+    )
+
+def _build_workflow(
+    state_class: Type[StateT],
+    input_type: Type[InputState],
+    tools_list: Iterable[BaseTool | SplitTool],
+    sys_prompt: str,
+    initial_prompt: str,
+    output_key: str,
+    unbound_llm: BaseChatModel,
+    output_schema: Optional[Type[OutputT]],
+    context_schema: Optional[Type[ContextT]],
+    summary_config: SummaryConfig[StateT] | None,
+    result_fact: _ResultFact,
+    init_fact: _InitialFact,
+    summary_fact: _SummarizerFact
+) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     """
     Build a standard workflow with initial node -> tools -> tool_result pattern.
     More specifically, the initial_prompt should instruct the LLM to use any of
@@ -345,9 +541,9 @@ def build_workflow(
     llm = unbound_llm.bind_tools(tool_schemas)
 
     # Create initial node and tool node with curried LLM
-    init_node = initial_node(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
+    init_node = init_fact(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
     tool_node = ToolNode(tool_impls, handle_tool_errors=False)
-    tool_result_node = tool_result_generator(state_class, llm)
+    tool_result_node = result_fact(state_class, llm)
 
     # Build the graph with fixed input schema, no context
     builder = StateGraph(
@@ -373,7 +569,7 @@ def build_workflow(
             else:
                 return "tool_result"
 
-        summarizer = get_summarizer(
+        summarizer = summary_fact(
             unbound_llm, sys_prompt, initial_prompt, state_class, summary_config
         )
         builder.add_node(SUMMARIZE_NODE, summarizer)
