@@ -13,7 +13,7 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired
+from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable
 from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
@@ -89,6 +89,19 @@ def tool_return(
             "messages": [ToolMessage(tool_call_id=tool_call_id, content=content)]
         }
     )
+
+def tool_state_update(
+    tool_call_id: str,
+    content: str,
+    **state_diff
+) -> Command:
+    update = {
+        "messages": [
+            ToolMessage(tool_call_id=tool_call_id, content=content)
+        ],
+        **state_diff
+    }
+    return Command(update=update)
 
 class FlowInput(TypedDict):
     """
@@ -258,10 +271,12 @@ SUMMARIZE_NODE = "summarize"
 
 BoundLLM = Runnable[LanguageModelInput, BaseMessage]
 
+SplitTool = tuple[dict[str, Any], BaseTool]
+
 def build_workflow(
     state_class: Type[StateT],
     input_type: Type[InputState],
-    tools_list: List[BaseTool],
+    tools_list: Iterable[BaseTool | SplitTool],
     sys_prompt: str,
     initial_prompt: str,
     output_key: str,
@@ -305,18 +320,33 @@ def build_workflow(
         if state.get(output_key, None) is not None:
             return "__end__"
         return "tool_result"
+    
+    tool_schemas : list[BaseTool | dict] = []
+    tool_impls : list[BaseTool] = []
 
-    if isinstance(unbound_llm, ChatAnthropic) and (beta_attr := getattr(unbound_llm, "betas", [])) is not None and "context-management-2025-06-27" in beta_attr:
-        llm = unbound_llm.bind_tools([{
-            "type": "memory_20250818",
-            "name": "memory"
-        } if t.name == "memory" else t for t in tools_list])
-    else:
-        llm = unbound_llm.bind_tools(tools_list)
+    supports_memory = isinstance(unbound_llm, ChatAnthropic) and \
+        (beta_attr := getattr(unbound_llm, "betas", [])) is not None and \
+            "context-management-2025-06-27" in beta_attr
+
+    for t in tools_list:
+        if isinstance(t, tuple):
+            tool_schemas.append(t[0])
+            tool_impls.append(t[1])
+        elif t.name == "memory" and supports_memory:
+            tool_schemas.append({
+                "type": "memory_20250818",
+                "name": "memory"
+            })
+            tool_impls.append(t)
+        else:
+            tool_schemas.append(t)
+            tool_impls.append(t)
+
+    llm = unbound_llm.bind_tools(tool_schemas)
 
     # Create initial node and tool node with curried LLM
     init_node = initial_node(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
-    tool_node = ToolNode(tools_list, handle_tool_errors=False)
+    tool_node = ToolNode(tool_impls, handle_tool_errors=False)
     tool_result_node = tool_result_generator(state_class, llm)
 
     # Build the graph with fixed input schema, no context
