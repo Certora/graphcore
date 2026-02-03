@@ -541,8 +541,8 @@ class Builder(
         self._copy_untyped_to_(to_ret)
         to_ret._tools.extend(l)
         return to_ret
-
-    def build(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+    
+    def _build_internal(self, r: _ResultFact, i: _InitialFact, s: _SummarizerFact) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
         if self._state_class is None:
             raise ValueError("state_class is required")
         if self._input_type is None:
@@ -556,7 +556,7 @@ class Builder(
         if self._unbound_llm is None:
             raise ValueError("unbound_llm is required")
 
-        return build_workflow(
+        return _build_workflow(
             state_class=self._state_class, #type: ignore
             input_type=self._input_type, #type: ignore
             tools_list=self._tools,
@@ -566,8 +566,24 @@ class Builder(
             unbound_llm=self._unbound_llm,
             context_schema=self._context_type,
             summary_config=self._summary_config, #type: ignore
+            init_fact=i,
+            result_fact=r,
+            summary_fact=s
         )
 
+    def build(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+        return self._build_internal(
+            s=get_summarizer,
+            i=initial_node,
+            r=tool_result_generator
+        )
+    
+    def build_async(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+        return self._build_internal(
+            s=get_async_summarizer,
+            i=async_initial_node,
+            r=async_tool_result_generator
+        )
 
 def build_workflow(
     state_class: Type[StateT],
