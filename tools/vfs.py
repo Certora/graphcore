@@ -194,35 +194,50 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 "vfs": files
             }
         )
+    
+    def _get_content(s: InputType, path: str) -> str | None:
+        if not get_filter(path):
+            return None
+        vfs = s["vfs"]
+        if path not in vfs:
+            layer = conf.get("fs_layer", None)
+            if layer is None:
+                return None
+            child = pathlib.Path(layer) / path
+            if not child.is_file():
+                return None
+            return child.read_text()
+        else:
+            vfs[path]
+
+    class FileRange(BaseModel):
+        start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
+        end_line: int = Field(description="The line to read until EXCLUSIVE.")
 
     @inject(doc_extra=conf.get('get_doc_extra'))
     class GetFileSchema(BaseModel):
         """
         Read the contents of the VFS at some relative path.
 
-        If the path doesn't exist, this function returns "File not found"
+        If the path doesn't exist, this function returns "File not found".
         """
         path: str = Field(description="The relative path of the file on the VFS. IMPORTANT: Do NOT include a leading `./` it is implied")
+        range: FileRange | None = Field(description="If set, (start, end) indicates to return lines starting from line `start` (lines are 1 indexed) until `end` (exclusive). If unset, the entire file is returned.")
 
     @tool(args_schema=GetFileSchema)
     def get_file(
         path: str,
+        range: FileRange | None,
         state: Annotated[InputType, InjectedState]
     ) -> str:
-        if not get_filter(path):
+        cont = _get_content(state, path)
+        if cont is None:
             return "File not found"
-
-        if path not in state["vfs"]:
-            if conf.get("fs_layer", None) is not None:
-                layer = conf.get("fs_layer")
-                assert layer is not None
-                p = pathlib.Path(layer)
-                child = p / path
-                if child.is_file():
-                    return child.read_text()
-            return "File not found"
-        else:
-            return state["vfs"][path]
+        if not range:
+            return cont
+        start = range.start_line - 1
+        to_ret = cont.splitlines()[start:range.end_line - 1]
+        return "\n".join(to_ret)
 
     @cache
     def list_underlying() -> Sequence[str]:
@@ -258,28 +273,50 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     @inject()
     class GrepFileSchema(BaseModel):
         """
-        Search for a specific string in the files on the VFS. Returns a list of
-        file names which contain the query somewhere in their contents. Matching
-        file names are output one per line. Empty lines should be ignored.
+        Search for a specific string in the files on the VFS. The output depends on the
+        value of the `matching_lines` argument. If false, returns a list of
+        file names which contain the query somewhere in their contents, with one file name per line.
+        If true, returns a list of matching lines in files with the format:
+        ```
+        $filename:$lineno:$line
+        ```
+        $line is a line matching the search string in $filename at $lineno (starting at 1).
+
+        In both output modes, empty lines should be ignored.
+
+        In both modes, the paths to search can be restricted with `match_in`.
         """
 
         search_string: str = Field(description="The query string to search for provided as a python regex. Thus, you must escape any special characters (like [, |, etc.)")
+        matching_lines: bool = Field(description="If true, show the matching lines and the line number; if false, simply list the matching files")
+        match_in: list[str] | None = Field(description="If set, narrow the search to only the paths listed here.", default=None)
 
     @tool(args_schema=GrepFileSchema)
     def grep_files(
         state: Annotated[InputType, InjectedState],
-        search_string: str
+        search_string: str,
+        matching_lines: bool,
+        match_in: list[str] | None = None
     ) -> str:
         comp: re.Pattern
         try:
-            comp = re.compile(search_string)
+            comp = re.compile(search_string, re.MULTILINE)
         except Exception:
             return "Illegal pattern name, check your syntax and try again."
+        
+        match_set = set(match_in) if match_in else None
 
         matches: list[str] = []
 
+        def should_search(s: str) -> bool:
+            if not get_filter(s):
+                return False
+            if match_set is None:
+                return True
+            return s in match_set
+
         for (k, v) in state["vfs"].items():
-            if not get_filter(k):
+            if not should_search(k):
                 continue
             if comp.search(v) is not None:
                 matches.append(k)
@@ -290,7 +327,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 if not f.is_file():
                     continue
                 rel_name = str(f.relative_to(p))
-                if not get_filter(rel_name):
+                if not should_search(rel_name):
                     continue
                 if rel_name in state["vfs"]:
                     continue
@@ -298,7 +335,21 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                     continue
                 matches.append(rel_name)
 
-        return "\n".join(matches)
+        if not matching_lines:
+            return "\n".join(matches)
+
+        matched_lines = []
+
+        for p in matches:
+            cont_s = _get_content(state, p)
+            assert cont_s is not None
+            cont = cont_s.splitlines()
+            for (lno, l) in enumerate(cont, start=1):
+                if comp.search(l):
+                    matched_lines.append(f"{p}:{lno}:{l}")
+
+        return "\n".join(matched_lines)
+
 
     tools: list[BaseTool] = [get_file, list_files, grep_files]
     if not conf["immutable"]:
