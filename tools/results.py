@@ -34,7 +34,7 @@ def result_tool_generator(
     outkey: str,
     result_schema: type[M],
     doc: str,
-    validator: tuple[type[ST], Callable[[ST, M, str], ValidationResult]]
+    validator: tuple[type[ST], Callable[[ST, M, str], ValidationResult]] | Callable[[M, str], ValidationResult] | None = None
 ) -> BaseTool:
     """
     Generates a tool that can be used to complete a workflow
@@ -56,58 +56,9 @@ def result_tool_generator(
 @overload
 def result_tool_generator(
     outkey: str,
-    result_schema: type[M],
-    doc: str,
-    validator: Callable[[M, str], ValidationResult]
-) -> BaseTool:
-    """
-    Generates a tool that can be used to complete a workflow
-    Args:
-        outkey (str): The name of the key in the state which holds the result, and whose presence signals
-          completion
-        result_schema (type[M]): A BaseModel type which is the type of the completed state. Each field of this
-           basemodel becomes a field in the generated tool schema, and so these fields SHOULD have string descriptions.
-        doc (str): The documentation to use for the generated tool
-        validator (Callable[[M, str], ValidationResult]): A validator which simply accepts the resultant basemodel
-          and the current tool call id, and return None if there is no issue, otherwise it may return a string
-          (which is returned as the result of the tool call WITHOUT setting outkey), or it may return an arbitrary command.
-
-    Returns:
-        BaseTool: The generated result tool
-    """
-    ...
-
-
-@overload
-def result_tool_generator(
-    outkey: str,
     result_schema: tuple[type[R], str],
     doc: str,
-    validator: Callable[[R, str], ValidationResult]
-) -> BaseTool:
-    """
-    Generates a tool that can be used to complete a workflow
-    Args:
-        outkey (str): The name of the key in the state which holds the result, and whose presence signals
-          completion
-        result_schema (tuple[type[R], str]): A tuple of the desired result type, and a description of what the output
-          should be.
-        doc (str): The documentation to use for the generated tool
-        validator (Callable[[R, str], ValidationResult]): A validator which simply accepts the resultant value
-          and the current tool call id, and return None if there is no issue, otherwise it may return a string
-          (which is returned as the result of the tool call WITHOUT setting outkey), or it may return an arbitrary command.
-
-    Returns:
-        BaseTool: The generated result tool
-    """
-    ...
-
-@overload
-def result_tool_generator(
-    outkey: str,
-    result_schema: tuple[type[R], str],
-    doc: str,
-    validator: tuple[type[ST], Callable[[ST, R, str], ValidationResult]]
+    validator: tuple[type[ST], Callable[[ST, R, str], ValidationResult]] | Callable[[R, str], ValidationResult] | None = None
 ) -> BaseTool:
     """
     Generates a tool that can be used to complete a workflow
@@ -121,26 +72,6 @@ def result_tool_generator(
            tool should be used, and a callback that takes the current state, the generated result,
            and the current tool id. The validator returns None to indicate there is no issue, otherwise it may return
            a string (which is returned as the result of the tool call WITHOUT setting outkey), or it may return a Command.
-
-    Returns:
-        BaseTool: The generated result tool
-    """
-    ...
-
-@overload
-def result_tool_generator(
-    outkey: str,
-    result_schema: type[BaseModel] | tuple[type, str],
-    doc: str,
-) -> BaseTool:
-    """
-    Generates a tool that can be used to complete a workflow
-    Args:
-        outkey (str): The name of the key in the state which holds the result, and whose presence signals
-          completion
-        result_schema (type[BaseModel] | tuple[type, str]): Either a BaseModel type (where each field becomes
-           a field in the generated tool schema) or a tuple of the desired result type and description.
-        doc (str): The documentation to use for the generated tool
 
     Returns:
         BaseTool: The generated result tool
