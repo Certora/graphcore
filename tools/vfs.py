@@ -208,7 +208,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 return None
             return child.read_text()
         else:
-            vfs[path]
+            return vfs[path]
 
     class FileRange(BaseModel):
         start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
@@ -340,13 +340,13 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
 
         matched_lines = []
 
-        for p in matches:
-            cont_s = _get_content(state, p)
+        for match_name in matches:
+            cont_s = _get_content(state, match_name)
             assert cont_s is not None
             cont = cont_s.splitlines()
             for (lno, l) in enumerate(cont, start=1):
                 if comp.search(l):
-                    matched_lines.append(f"{p}:{lno}:{l}")
+                    matched_lines.append(f"{match_name}:{lno}:{l}")
 
         return "\n".join(matched_lines)
 
