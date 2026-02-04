@@ -568,7 +568,8 @@ class Builder(
             summary_config=self._summary_config, #type: ignore
             init_fact=i,
             result_fact=r,
-            summary_fact=s
+            summary_fact=s,
+            output_schema=None
         )
 
     def build(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
