@@ -20,6 +20,8 @@ from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable
 from langgraph.graph import StateGraph, MessagesState
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Checkpointer
 from langgraph._internal._typing import StateLike
 from langgraph.types import Command
 from langgraph.prebuilt import ToolNode
@@ -584,6 +586,19 @@ class Builder(
             s=get_async_summarizer,
             i=async_initial_node,
             r=async_tool_result_generator
+        )
+    
+    def compile_async(
+        self, *,
+        checkpointer: Checkpointer = None
+    ) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        return self.build_async()[0].compile(
+            checkpointer=checkpointer
+        )
+
+    def compile(self, checkpointer: Checkpointer = None) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        return self.build()[0].compile(
+            checkpointer=checkpointer
         )
 
 def build_workflow(

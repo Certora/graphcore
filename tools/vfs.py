@@ -48,6 +48,20 @@ def _make_checker(patt: str | None) -> Callable[[str], bool]:
     match = re.compile(patt)
     return lambda f_name: match.fullmatch(f_name) is None
 
+class FileRange(BaseModel):
+    start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
+    end_line: int = Field(description="The line to read until EXCLUSIVE.")
+
+def _get_file(cont: str | None, range: FileRange | None) -> str:
+    if cont is None:
+        return "File not found"
+    if not range:
+        return cont
+    start = range.start_line - 1
+    to_ret = cont.splitlines()[start:range.end_line - 1]
+    return "\n".join(to_ret)
+
+
 
 def _grep_impl(
     search_string: str,
@@ -78,8 +92,8 @@ def _grep_impl(
     match_set = None if not match_in else set(match_in)
 
     should_search = \
-        lambda _: True if match_set is None else \
-        lambda f: f in match_set
+        (lambda _: True) if match_set is None else \
+        (lambda f: f in match_set)
 
     for (k, v) in file_contents:
         if not should_search(k):
@@ -103,9 +117,6 @@ def _grep_impl(
     return "\n".join(matched_lines)
 
 
-class FileRange(BaseModel):
-    start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
-    end_line: int = Field(description="The line to read until EXCLUSIVE.")
 
 class _GetFileSchemaBase(BaseModel):
     """
@@ -114,7 +125,7 @@ class _GetFileSchemaBase(BaseModel):
     If the path doesn't exist, this function returns "File not found".
     """
     path: str = Field(description="The relative path of the file on the VFS. IMPORTANT: Do NOT include a leading `./` it is implied")
-    range: FileRange | None = Field(description="If set, (start, end) indicates to return lines starting from line `start` (lines are 1 indexed) until `end` (exclusive). If unset, the entire file is returned.")
+    range: FileRange | None = Field(description="If set, (start, end) indicates to return lines starting from line `start` (lines are 1 indexed) until `end` (exclusive). If unset, the entire file is returned.", default=None)
 
 
 class _ListFileSchemaBase(BaseModel):
@@ -335,17 +346,11 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     @tool(args_schema=GetFileSchema)
     def get_file(
         path: str,
-        range: FileRange | None,
-        state: Annotated[InputType, InjectedState]
+        state: Annotated[InputType, InjectedState],
+        range: FileRange | None = None
     ) -> str:
         cont = _get_content(state, path)
-        if cont is None:
-            return "File not found"
-        if not range:
-            return cont
-        start = range.start_line - 1
-        to_ret = cont.splitlines()[start:range.end_line - 1]
-        return "\n".join(to_ret)
+        return _get_file(cont, range)
 
     @cache
     def list_underlying() -> Sequence[str]:
@@ -436,13 +441,13 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None) -> list[BaseTool]
         pass
 
     @tool(args_schema=GetFileSchema)
-    def get_file(path: str) -> str:
+    def get_file(path: str, range: FileRange | None = None) -> str:
         if not check_allowed(path):
             return "File not found"
         child = base_path / path
         if child.is_file():
             try:
-                return child.read_text()
+                return _get_file(child.read_text(), range)
             except Exception:
                 return "File not found"
         return "File not found"
@@ -463,7 +468,7 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None) -> list[BaseTool]
     def grep_files(
         search_string: str,
         matching_lines: bool,
-        match_in: list[str] | None
+        match_in: list[str] | None = None
     ) -> str:
         def file_contents() -> Iterator[tuple[str, str]]:
             for f in base_path.rglob("*"):

@@ -54,12 +54,13 @@ class WithAsyncImplementation(BaseModel, Generic[T_RES]):
         impl_method = getattr(cls, "run")
         
         # Simple wrapper - just accept kwargs, instantiate model, call method
-        def wrapper(**kwargs: Any) -> Any:
+        async def wrapper(**kwargs: Any) -> Any:
             instance = cls(**kwargs)
-            return impl_method(instance)
+            d = await impl_method(instance)
+            return d
         
         return StructuredTool.from_function(
-            func=wrapper,
+            coroutine=wrapper,
             args_schema=cls,
             description=cls.__doc__,
             name=name,
