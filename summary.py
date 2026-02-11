@@ -17,7 +17,7 @@ import logging
 
 from typing import Generic, TypeVar
 
-StateT = TypeVar("StateT")
+StateT = TypeVar("StateT", contravariant=True)
 
 logger = logging.getLogger(__name__)
 
