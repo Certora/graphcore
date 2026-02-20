@@ -13,13 +13,15 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Callable, Generator, Awaitable, Coroutine
+from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
 from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import Runnable
 from langgraph.graph import StateGraph, MessagesState
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Checkpointer
 from langgraph._internal._typing import StateLike
 from langgraph.types import Command
 from langgraph.prebuilt import ToolNode
@@ -408,6 +410,196 @@ SUMMARIZE_NODE = "summarize"
 BoundLLM = LLM
 
 SplitTool = tuple[dict[str, Any], BaseTool]
+
+_BStateT = TypeVar("_BStateT", bound=MessagesState | None)
+_BStateBind = TypeVar("_BStateBind", bound=MessagesState)
+
+_BContextT = TypeVar("_BContextT", bound=StateLike | None)
+_BContextBind = TypeVar("_BContextBind", bound=StateLike)
+
+_BInputT = TypeVar("_BInputT", bound=FlowInput | None)
+_BInputTBind = TypeVar("_BInputTBind", bound=FlowInput)
+
+
+class TemplateLoader(Protocol):
+    def __call__(self, template_name: str, **kwargs: Any) -> str: ...
+
+
+class Builder(
+    Generic[_BStateT, _BContextT, _BInputT]
+):
+    def __init__(self):
+        self._initial_prompt : str | None = None
+        self._sys_prompt : str | None = None
+
+        self._summary_config : SummaryConfig[_BStateT] | None = None
+        self._unbound_llm : BaseChatModel | None = None
+
+        self._state_class: type[_BStateT] | None = None
+        self._input_type : type[_BInputT] | None = None
+        self._context_type : type[_BContextT] | None = None
+        self._output_key : str | None = None
+        self._tools : list[BaseTool | SplitTool] = []
+        self._loader : TemplateLoader | None = None
+
+    def _copy_untyped_to_(self, other: "Builder[Any, Any, Any]"):
+        other._initial_prompt = self._initial_prompt
+        other._sys_prompt = self._sys_prompt
+        other._unbound_llm = self._unbound_llm
+        other._output_key = self._output_key
+        other._tools.extend(self._tools)
+        other._loader = self._loader
+
+    def _copy_typed_to(self, other: "Builder[_BStateT, _BContextT, _BInputT]"):
+        other._state_class = self._state_class
+        other._context_type = self._context_type
+        other._input_type = self._input_type
+        other._summary_config = self._summary_config
+
+    def with_state(self, t: type[_BStateBind]) -> "Builder[_BStateBind, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateBind, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        to_ret._state_class = t
+        to_ret._context_type = self._context_type
+        to_ret._input_type = self._input_type
+        return to_ret
+
+    def with_context(self, t: type[_BContextBind]) -> "Builder[_BStateT, _BContextBind, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextBind, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        to_ret._state_class = self._state_class
+        to_ret._context_type = t
+        to_ret._input_type = self._input_type
+        to_ret._summary_config = self._summary_config
+        return to_ret
+
+    def with_input(self, t: type[_BInputTBind]) -> "Builder[_BStateT, _BContextT, _BInputTBind]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputTBind]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        to_ret._state_class = self._state_class
+        to_ret._context_type = self._context_type
+        to_ret._input_type = t
+        to_ret._summary_config = self._summary_config
+        return to_ret
+
+    def with_initial_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._initial_prompt = prompt
+        return to_ret
+
+    def with_initial_prompt_template(self, template: str, **kwargs) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        if self._loader is None:
+            raise ValueError("No loader configured. Use with_loader first.")
+        return self.with_initial_prompt(self._loader(template, **kwargs))
+
+    def with_sys_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._sys_prompt = prompt
+        return to_ret
+
+    def with_sys_prompt_template(self, template: str, **kwargs) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        if self._loader is None:
+            raise ValueError("No loader configured. Use with_loader first.")
+        return self.with_sys_prompt(self._loader(template, **kwargs))
+
+    def with_loader(self, loader: TemplateLoader) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._loader = loader
+        return to_ret
+
+    def with_llm(self, llm: BaseChatModel) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._unbound_llm = llm
+        return to_ret
+
+    def with_output_key(self, key: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._output_key = key
+        return to_ret
+
+    def with_summary_config(self, config: SummaryConfig[_BStateT]) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._summary_config = config
+        return to_ret
+
+    def with_default_summarizer(self, *, max_messages: int = 20, enabled: bool = True) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        return self.with_summary_config(SummaryConfig(max_messages=max_messages, enabled=enabled))
+
+    def with_tools(self, l: Iterable[BaseTool | SplitTool]) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_typed_to(to_ret)
+        self._copy_untyped_to_(to_ret)
+        to_ret._tools.extend(l)
+        return to_ret
+    
+    def _build_internal(self, r: _ResultFact, i: _InitialFact, s: _SummarizerFact) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+        if self._state_class is None:
+            raise ValueError("state_class is required")
+        if self._input_type is None:
+            raise ValueError("input_type is required")
+        if self._sys_prompt is None:
+            raise ValueError("sys_prompt is required")
+        if self._initial_prompt is None:
+            raise ValueError("initial_prompt is required")
+        if self._output_key is None:
+            raise ValueError("output_key is required")
+        if self._unbound_llm is None:
+            raise ValueError("unbound_llm is required")
+
+        return _build_workflow(
+            state_class=self._state_class, #type: ignore
+            input_type=self._input_type, #type: ignore
+            tools_list=self._tools,
+            sys_prompt=self._sys_prompt,
+            initial_prompt=self._initial_prompt,
+            output_key=self._output_key,
+            unbound_llm=self._unbound_llm,
+            context_schema=self._context_type,
+            summary_config=self._summary_config, #type: ignore
+            init_fact=i,
+            result_fact=r,
+            summary_fact=s,
+            output_schema=None
+        )
+
+    def build(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+        return self._build_internal(
+            s=get_summarizer,
+            i=initial_node,
+            r=tool_result_generator
+        )
+    
+    def build_async(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+        return self._build_internal(
+            s=get_async_summarizer,
+            i=async_initial_node,
+            r=async_tool_result_generator
+        )
+    
+    def compile_async(
+        self, *,
+        checkpointer: Checkpointer = None
+    ) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        return self.build_async()[0].compile(
+            checkpointer=checkpointer
+        )
+
+    def compile(self, checkpointer: Checkpointer = None) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        return self.build()[0].compile(
+            checkpointer=checkpointer
+        )
 
 def build_workflow(
     state_class: Type[StateT],
