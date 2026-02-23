@@ -84,12 +84,23 @@ def add_cache_control(s: List[AnyMessage]) -> List[AnyMessage]:
                 continue
     return s
 
+def _log_cache_stats(to_ret: BaseMessage) -> None:
+    """Log cache statistics from response metadata if available."""
+    # if hasattr(to_ret, 'response_metadata'):
+    #     usage = to_ret.response_metadata.get('usage', {})
+    #     created = usage.get('cache_creation_input_tokens', 0)
+    #     read = usage.get('cache_read_input_tokens', 0)
+    #     if created or read:
+    #         print(f"Cache: created={created}, read={read}")
+
+
 def cached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[AnyMessage]) -> BaseMessage:
     """
     Send messages `s` to the llm `b` after adding caching instructions.
     """
     canon = add_cache_control(s)
     to_ret = b.invoke(canon)
+    _log_cache_stats(to_ret)
     return to_ret
 
 async def acached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[AnyMessage]) -> BaseMessage:
@@ -98,4 +109,5 @@ async def acached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[A
     """
     canon = add_cache_control(s)
     to_ret = await b.ainvoke(canon)
+    _log_cache_stats(to_ret)
     return to_ret
