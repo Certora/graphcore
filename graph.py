@@ -262,7 +262,7 @@ def _get_summarizer_pure(
         assert len(messages) >= config.max_messages
 
         try:
-            msg = yield(messages + [HumanMessage(content=summary_prompt)])
+            msg = yield(messages + [HumanMessage(content=summary_prompt, display_tag="summarization")])
             assert isinstance(msg, AIMessage)
             summary = msg.text()
             resume_message = config.get_resume_prompt(state, summary)
@@ -271,8 +271,8 @@ def _get_summarizer_pure(
                 "messages": [
                     RemoveMessage(id="__remove_all__"),
                     SystemMessage(content=system_prompt),
-                    HumanMessage(content=initial_prompt),
-                    HumanMessage(content=resume_message),
+                    HumanMessage(content=initial_prompt, display_tag="initial_prompt"),
+                    HumanMessage(content=resume_message, display_tag="resume"),
                 ]
             }
         except Exception:
@@ -288,7 +288,8 @@ def _get_scolding_pure(
         m = state["messages"].copy()
         scolding = HumanMessage(
             content="Every AI turn must end with at least one tool call. Double check your initial prompt for what tools you should be using. " \
-            "In particular, if you are done processing, make sure to deliver your output via the result tool."
+            "In particular, if you are done processing, make sure to deliver your output via the result tool.",
+            display_tag="scolding"
         )
         m.append(scolding)
         res = yield m
@@ -329,7 +330,8 @@ def _get_initial_pure(
 
         initial_messages.append(
             HumanMessage(
-                content=prompt_and_input_message
+                content=prompt_and_input_message,
+                display_tag="initial_prompt"
             )
         )
         # The format of the initial message is:
