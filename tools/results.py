@@ -14,7 +14,8 @@
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Annotated, TypeVar, Callable, overload, Any, cast
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model, model_validator
+from pydantic_core import PydanticCustomError
 from langchain_core.tools import tool, BaseTool, InjectedToolCallId
 from langgraph.types import Command
 from langgraph.prebuilt import InjectedState
@@ -140,18 +141,33 @@ def result_tool_generator(
         # Case 2: result_schema is a tuple[type, str]
         field_type, field_description = result_schema
 
+        _schema_field = "value"
         field_definitions = {
-            outkey: (field_type, Field(description=field_description)),
+            _schema_field: (field_type, Field(description=field_description)),
             'tool_call_id': (Annotated[str, InjectedToolCallId], Field())
         }
         maybe_inject_state(field_definitions)
+
+        def missing_value_validator(values: Any) -> Any:
+            if isinstance(values, dict):
+                if _schema_field not in values:
+                    raise PydanticCustomError(
+                        "missing-argument-field",
+                        "Missing required field which should hold your result: `{field_name}`. Double check your tool schema and try again, providing the required field.",
+                        {"field_name": _schema_field}
+                    )
+            return values
+        
+        field_validator : Callable[..., Any] = model_validator(mode="before")(missing_value_validator) #type: ignore
+
         schema = create_model(
             'ResultToolSchema',
             __doc__=doc,
+            __validators__={"has_value_field": field_validator},
             **field_definitions
         )
 
         @tool(args_schema=schema)
         def result(**kwargs) -> Command | str:
-            return run_checks(kwargs, kwargs[outkey])
+            return run_checks(kwargs, kwargs[_schema_field])
         return result

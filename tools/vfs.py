@@ -414,7 +414,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     return (tools, materializer)
 
 
-def fs_tools(fs_layer: str, forbidden_read: str | None = None) -> list[BaseTool]:
+def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing: bool = True) -> list[BaseTool]:
     """
     Create stateless file system tools that operate directly on a directory.
 
@@ -425,6 +425,8 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None) -> list[BaseTool]
     Args:
         fs_layer: Path to the directory to expose
         forbidden_read: Optional regex pattern for paths that cannot be read
+        cache_listing: If True (default), cache the directory listing after first call.
+            Set to False if the agent needs to react to filesystem changes.
 
     Returns:
         List of tools: [get_file, list_files, grep_files]
@@ -432,9 +434,13 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None) -> list[BaseTool]
     base_path = pathlib.Path(fs_layer)
     check_allowed = _make_checker(forbidden_read)
 
-    @cache
-    def list_all_files() -> Sequence[str]:
+    def _list_all_files() -> Sequence[str]:
         return [str(f.relative_to(base_path)) for f in base_path.rglob("*") if f.is_file()]
+
+    if cache_listing:
+        _list_all_files = cache(_list_all_files)
+
+    list_all_files = _list_all_files
 
     @_copy_base_doc
     class GetFileSchema(_GetFileSchemaBase):

@@ -13,7 +13,8 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional, List, TypedDict, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
+from typing import Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
+from typing_extensions import TypedDict
 from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
@@ -23,7 +24,7 @@ from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Checkpointer
 from langgraph._internal._typing import StateLike
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 from langgraph.prebuilt import ToolNode
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
@@ -279,25 +280,18 @@ def _get_summarizer_pure(
             return {}
     return to_return
 
-def _get_scolding_pure(
-    t: type[StateT]
-) -> PureFunction[StateT, dict[str, list[BaseMessage]]]:
-    def impl(
-        state: StateT
-    ) -> PureFunctionGenerator[dict[str, list[BaseMessage]]]:
-        m = state["messages"].copy()
-        scolding = HumanMessage(
-            content="Every AI turn must end with at least one tool call. Double check your initial prompt for what tools you should be using. " \
-            "In particular, if you are done processing, make sure to deliver your output via the result tool.",
-            display_tag="scolding"
-        )
-        m.append(scolding)
-        res = yield m
-        assert isinstance(res, AIMessage)
-        return {
-            "messages": [scolding, res]
-        }
-    return impl
+def _scolding_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    return {"messages": [HumanMessage(
+        content="Every AI turn must end with at least one tool call. Double check your "
+                "initial prompt for what tools you should be using. In particular, if you "
+                "are done processing, make sure to deliver your output via the result tool.",
+        display_tag="scolding"
+    )]}
+
+def _default_conversation_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    last = state["messages"][-1]
+    response = interrupt({"type": "conversation", "message": last})
+    return {"messages": [HumanMessage(content=response)]}
 
 I = TypeVar("I", bound=FlowInput)
 O = TypeVar("O")
@@ -423,37 +417,11 @@ class _InitialFact(Protocol):
     ) -> AnyNodeFunction[InputState, StateT]:
         ...
 
-class _ScoldingFact(Protocol):
-    def __call__(
-        self,
-        llm: LLM,
-        ty: type[StateT]
-    ) -> AnyChatNodeFunction[StateT]:
-        ...
-
-def get_async_scolder(
-    llm: LLM,
-    ty: type[StateT]
-) -> AsyncChatNodeFunction[StateT]:
-    return _stitch_async_impl(
-        _get_scolding_pure(ty),
-        _async_llm(llm)
-    )
-
-def get_sync_scolder(
-    llm: LLM,
-    ty: type[StateT]
-) -> ChatNodeFunction[StateT]:
-    return _stitch_sync_impl(
-        _get_scolding_pure(ty),
-        _sync_llm(llm)
-    )
-
 INITIAL_NODE = "initial"
 TOOLS_NODE = "tools"
 TOOL_RESULT_NODE = "tool_result"
 SUMMARIZE_NODE = "summarize"
-SCOLDING_NODE = "scold"
+NO_TOOLS_NODE = "no_tools"
 
 BoundLLM = LLM
 
@@ -489,6 +457,7 @@ class Builder(
         self._output_key : str | None = None
         self._tools : list[BaseTool | SplitTool] = []
         self._loader : TemplateLoader | None = None
+        self._conversation_handler : AnyChatNodeFunction[_BStateT] | None = None
 
     def _copy_untyped_to_(self, other: "Builder[Any, Any, Any]"):
         other._initial_prompt = self._initial_prompt
@@ -503,6 +472,7 @@ class Builder(
         other._context_type = self._context_type
         other._input_type = self._input_type
         other._summary_config = self._summary_config
+        other._conversation_handler = self._conversation_handler
 
     def with_state(self, t: type[_BStateBind]) -> "Builder[_BStateBind, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateBind, _BContextT, _BInputT]" = Builder()
@@ -519,6 +489,7 @@ class Builder(
         to_ret._context_type = t
         to_ret._input_type = self._input_type
         to_ret._summary_config = self._summary_config
+        to_ret._conversation_handler = self._conversation_handler
         return to_ret
 
     def with_input(self, t: type[_BInputTBind]) -> "Builder[_BStateT, _BContextT, _BInputTBind]":
@@ -528,6 +499,7 @@ class Builder(
         to_ret._context_type = self._context_type
         to_ret._input_type = t
         to_ret._summary_config = self._summary_config
+        to_ret._conversation_handler = self._conversation_handler
         return to_ret
 
     def with_initial_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -591,8 +563,20 @@ class Builder(
         self._copy_untyped_to_(to_ret)
         to_ret._tools.extend(l)
         return to_ret
-    
-    def _build_internal(self, r: _ResultFact, i: _InitialFact, s: _SummarizerFact, scold: _ScoldingFact) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
+
+    def with_conversation(
+        self,
+        fn: AnyChatNodeFunction[_BStateT] | None = None
+    ) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        if self._state_class is None:
+            raise ValueError("State type must be set before configuring conversation mode")
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._conversation_handler = fn if fn is not None else cast(AnyChatNodeFunction[_BStateT], _default_conversation_node)
+        return to_ret
+
+    def _build_internal(self, r: _ResultFact, i: _InitialFact, s: _SummarizerFact) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
         if self._state_class is None:
             raise ValueError("state_class is required")
         if self._input_type is None:
@@ -620,7 +604,7 @@ class Builder(
             result_fact=r,
             summary_fact=s,
             output_schema=None,
-            scolder=scold
+            no_tools_fn=self._conversation_handler, #type: ignore
         )
 
     def build(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
@@ -628,15 +612,13 @@ class Builder(
             s=get_summarizer,
             i=initial_node,
             r=tool_result_generator,
-            scold=get_sync_scolder
         )
-    
+
     def build_async(self) -> Tuple["StateGraph[_BStateT, _BContextT, _BInputT, Any]", BoundLLM]: #type: ignore
         return self._build_internal(
             s=get_async_summarizer,
             i=async_initial_node,
             r=async_tool_result_generator,
-            scold=get_async_scolder
         )
     
     def compile_async(
@@ -678,7 +660,6 @@ def build_workflow(
         tool_result_generator,
         initial_node,
         get_summarizer,
-        get_sync_scolder
     )
 
 
@@ -708,7 +689,6 @@ def build_async_workflow(
         async_tool_result_generator,
         async_initial_node,
         get_async_summarizer,
-        get_async_scolder
     )
 
 def _build_workflow(
@@ -725,7 +705,7 @@ def _build_workflow(
     result_fact: _ResultFact,
     init_fact: _InitialFact,
     summary_fact: _SummarizerFact,
-    scolder: _ScoldingFact,
+    no_tools_fn: AnyChatNodeFunction[StateT] | None = None,
 ) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     """
     Build a standard workflow with initial node -> tools -> tool_result pattern.
@@ -750,9 +730,11 @@ def _build_workflow(
         output_schema: (Optional) if non-none, describes the output format of the computation.
         context_schema: (Optional) if non-none, the type of contexts passed through the computation
         summary_config: if non-none, the parameters and prompts for history summarization.
+        no_tools_fn: (Optional) node function for when the AI responds without tool calls.
+            Defaults to scolding. Used by conversation mode to interrupt for human input instead.
 
     Returns:
-        The state graph compiled to execute the workflow above, and the llm wth the tools bound
+        The state graph compiled to execute the workflow above, and the llm with the tools bound
         and configured.
     """
 
@@ -762,17 +744,14 @@ def _build_workflow(
         if state.get(output_key, None) is not None:
             return "__end__"
         return "tool_result"
-    
-    def should_scold_about_tools(state: StateT) -> Literal["tools", "scold"]:
+
+    def ai_message_router(state: StateT) -> Literal["tools", "no_tools"]:
         m = state["messages"]
         last = m[-1]
         if not isinstance(last, AIMessage):
             raise ValueError("Routing is broken, have non-AI message at end of message")
-        if len(last.tool_calls) == 0:
-            return "scold"
-        else:
-            return "tools"
-    
+        return "tools" if last.tool_calls else "no_tools"
+
     tool_schemas : list[BaseTool | dict] = []
     tool_impls : list[BaseTool] = []
 
@@ -813,11 +792,14 @@ def _build_workflow(
     builder.add_node(INITIAL_NODE, init_node, input_schema=input_type)
     builder.add_node(TOOLS_NODE, tool_node)
     builder.add_node(TOOL_RESULT_NODE, tool_result_node)
-    builder.add_conditional_edges(INITIAL_NODE, should_scold_about_tools)
-    builder.add_conditional_edges(SCOLDING_NODE, should_scold_about_tools)
-    builder.add_conditional_edges(TOOL_RESULT_NODE, should_scold_about_tools)
+    if no_tools_fn is not None:
+        builder.add_node(NO_TOOLS_NODE, no_tools_fn)
+    else:
+        builder.add_node(NO_TOOLS_NODE, _scolding_node)
 
-    builder.add_node(SCOLDING_NODE, scolder(llm, state_class))
+    builder.add_conditional_edges(INITIAL_NODE, ai_message_router)
+    builder.add_conditional_edges(TOOL_RESULT_NODE, ai_message_router)
+    builder.add_edge(NO_TOOLS_NODE, TOOL_RESULT_NODE)
 
     if summary_config is not None:
         def routing(state: StateT) -> Literal["summarize", "tool_result", "__end__"]:
@@ -832,7 +814,7 @@ def _build_workflow(
             unbound_llm, sys_prompt, initial_prompt, state_class, summary_config
         )
         builder.add_node(SUMMARIZE_NODE, summarizer)
-        builder.add_edge(SUMMARIZE_NODE, TOOL_RESULT_NODE)  
+        builder.add_edge(SUMMARIZE_NODE, TOOL_RESULT_NODE)
         builder.add_conditional_edges(TOOLS_NODE, routing)
     else:
         builder.add_conditional_edges(TOOLS_NODE, should_end)
