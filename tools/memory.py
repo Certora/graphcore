@@ -139,6 +139,8 @@ class MemoryBackend(ABC):
             return "\n".join(numbered_lines)
 
     def create(self, path: str, content: str) -> str:
+        if path == "/memories":
+            return "`/memories` is a directory and cannot be written to."
         curr_path = self._validate(path)
         stat = self.stat(curr_path)
         if stat.exists and stat.is_dir:

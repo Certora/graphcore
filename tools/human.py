@@ -44,7 +44,7 @@ def _process_model_basem(
         if get_origin(ty) is Literal:
             if k != "type":
                 raise RuntimeError(f"Illegal type annotation: {v} on {k}")
-            disc = get_args(v)[0]
+            disc = get_args(ty)[0]
             continue
         fields[k] = (v.annotation, Field(description=v.description))
     return (fields, disc)
