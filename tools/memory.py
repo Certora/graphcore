@@ -17,7 +17,7 @@ from typing import (
     Literal, Optional, override, Protocol, Any, TypeVar, Iterator, 
     ContextManager, LiteralString, cast, Generator,
     AsyncContextManager, AsyncIterator, Callable, Awaitable, Sequence,
-    Never
+    Never, ParamSpec
 )
 from typing_extensions import Iterable
 from abc import ABC, abstractmethod
@@ -970,17 +970,31 @@ CREATE INDEX IF NOT EXISTS memories_namespace_path ON memories_fs(namespace, ful
 
     def _replace_first(self, target, src_str, result) -> str:
         return str(target).replace(str(src_str), str(result), 1)
+    
+type _NoYieldProtocol[T] = Generator[Never, Never, T]
+
+GenParam = ParamSpec("GenParam")
+
+RET_T = TypeVar("RET_T")
+
+def to_generator(cb: Callable[GenParam, RET_T]) -> Callable[GenParam, _NoYieldProtocol[RET_T]]:
+    def wrapper(*args: GenParam.args, **kwargs: GenParam.kwargs) -> _NoYieldProtocol[RET_T]:
+        to_wrap = cb(*args, **kwargs)
+        if False:
+            yield
+        return to_wrap
+    return wrapper
+
 
 class PureFilesystemLogic(PureMemoryBackend[Never, Never, Never, Never]):
-    def __init__(self, storage_folder: pathlib.Path, init_from: pathlib.Path | None = None):
+    def __init__(self, storage_folder: pathlib.Path):
         self.memory_root = storage_folder
-        if self._is_empty() and init_from is not None:
-            self._init_from(init_from)
 
     def _relativize(self, path: str) -> pathlib.Path:
         r = pathlib.Path(path).relative_to("/memories")
         return (self.memory_root / r).resolve()
 
+    @to_generator
     @override
     def stat_pure(self, path: str) -> FileStat:
         actual = self._relativize(path)
@@ -988,18 +1002,24 @@ class PureFilesystemLogic(PureMemoryBackend[Never, Never, Never, Never]):
             return FileStat(exists=False, is_dir=False)
         return FileStat(exists=True, is_dir=actual.is_dir())
 
-    def write_file(self, path: str, content: str):
+    @to_generator
+    @override
+    def write_file_pure(self, path: str, content: str):
         r = self._relativize(path)
         r.parent.mkdir(parents=True, exist_ok=True)
         r.write_text(content)
 
-    def read_file(self, path: str) -> str | None:
+    @to_generator
+    @override
+    def read_file_pure(self, path: str) -> str | None:
         r = self._relativize(path)
         if not r.is_file():
             return None
         return r.read_text()
 
-    def do_rename(self, old_path: str, new_path: str) -> str:
+    @to_generator
+    @override
+    def do_rename_pure(self, old_path: str, new_path: str) -> str:
         old_full_path = self._relativize(old_path)
         new_full_path = self._relativize(new_path)
 
@@ -1008,83 +1028,71 @@ class PureFilesystemLogic(PureMemoryBackend[Never, Never, Never, Never]):
 
         return f"Renamed {old_path} -> {new_path}"
 
-    def list_dir(self, path: str) -> Iterable[tuple[str, bool]]:
+    @to_generator
+    @override
+    def list_dir_pure(self, path: str) -> list[tuple[str, bool]]:
         r = self._relativize(path)
+        to_ret : list[tuple[str, bool]]= []
         for it in r.iterdir():
-            yield (str(it.relative_to(r)), it.is_dir())
+            to_ret.append(
+                (str(it.relative_to(r)), it.is_dir())
+            )
+        return to_ret
+    
+    @to_generator
+    @override
+    def rm_pure(self, path: str) -> str:
+        r = self._relativize(path)
+        if r.is_dir():
+            shutil.rmtree(r)
+        else:
+            r.unlink()
+        return f"Removed {path}"
 
-    def _is_empty(self) -> bool:
-        try:
-            next(pathlib.Path(self.memory_root).rglob("*"))
-            return False
-        except StopIteration:
-            return True
-
-    def _init_from(self, other_dir: pathlib.Path) -> None:
-        for r in other_dir.glob("*"):
-            if r.is_dir():
-                shutil.copytree(src=r, dst=pathlib.Path(self.memory_root) / r.name)
-            else:
-                shutil.copy(r, self.memory_root)
 
 
-class FileSystemMemoryBackend():
+class FileSystemMemoryBackend(MemoryBackend[Never, Never, Never, Never]):
     """
     A simple backend that "mounts" `/memories` to the storage folder given as the constructor arg.
     """
     def __init__(self, storage_folder: pathlib.Path, init_from: pathlib.Path | None = None):
-        self.memory_root = storage_folder
-        if self._is_empty() and init_from is not None:
-            self._init_from(init_from)
+        super().__init__(PureFilesystemLogic(storage_folder))
+        if self._is_empty(storage_folder) and init_from is not None:
+            self._init_from(storage_folder, init_from)
 
-    def _relativize(self, path: str) -> pathlib.Path:
-        r = pathlib.Path(path).relative_to("/memories")
-        return (self.memory_root / r).resolve()
 
-    def stat(self, path: str) -> FileStat:
-        actual = self._relativize(path)
-        if not actual.exists():
-            return FileStat(exists=False, is_dir=False)
-        return FileStat(exists=True, is_dir=actual.is_dir())
-
-    def write_file(self, path: str, content: str):
-        r = self._relativize(path)
-        r.parent.mkdir(parents=True, exist_ok=True)
-        r.write_text(content)
-
-    def read_file(self, path: str) -> str | None:
-        r = self._relativize(path)
-        if not r.is_file():
-            return None
-        return r.read_text()
-
-    def do_rename(self, old_path: str, new_path: str) -> str:
-        old_full_path = self._relativize(old_path)
-        new_full_path = self._relativize(new_path)
-
-        new_full_path.parent.mkdir(parents=True, exist_ok=True)
-        old_full_path.rename(new_full_path)
-
-        return f"Renamed {old_path} -> {new_path}"
-
-    def list_dir(self, path: str) -> Iterable[tuple[str, bool]]:
-        r = self._relativize(path)
-        for it in r.iterdir():
-            yield (str(it.relative_to(r)), it.is_dir())
-
-    def _is_empty(self) -> bool:
+    def _is_empty(self, mem_root: pathlib.Path) -> bool:
         try:
-            next(pathlib.Path(self.memory_root).rglob("*"))
+            next(mem_root.rglob("*"))
             return False
         except StopIteration:
             return True
 
-    def _init_from(self, other_dir: pathlib.Path) -> None:
+    def _init_from(self, memory_root: pathlib.Path, other_dir: pathlib.Path) -> None:
         for r in other_dir.glob("*"):
             if r.is_dir():
-                shutil.copytree(src=r, dst=pathlib.Path(self.memory_root) / r.name)
+                shutil.copytree(src=r, dst=pathlib.Path(memory_root) / r.name)
             else:
-                shutil.copy(r, self.memory_root)
+                shutil.copy(r, memory_root)
+
+    def _run_all[T](self, d: Generator[Never, Never, T]) -> T:
+        try:
+            next(d)
+            assert False
+        except StopIteration as e:
+            return e.value
+
+    @override
+    def _run_multi[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
+
+    @override
+    def _run_row[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
+    
+    @override
+    def _run_update[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
 
 def _memory_tool_impl[R](
     backend: MemoryToolImpl[R],
