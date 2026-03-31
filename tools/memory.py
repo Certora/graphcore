@@ -228,6 +228,11 @@ class MemoryToolImpl[RespType](Protocol):
         ...
 
 
+class MemoryToolImplForTest[RespType, ReadResp](MemoryToolImpl[RespType], Protocol):
+    """Extends MemoryToolImpl with read_file for test assertions only."""
+    def read_file(self, path: str) -> ReadResp:
+        ...
+
 class MemoryBackend[P, Update, Row, RList](ABC):
     """
     Implements most of the operations required by the memory tool, but leaves the details of
@@ -262,16 +267,11 @@ class MemoryBackend[P, Update, Row, RList](ABC):
         ...
 
     def read_file(self, path: str) -> Optional[str]:
+        """Test-only: read raw file content bypassing path validation and view formatting."""
         return self._run_row(
             self.logic.read_file_pure(path)
         )
 
-    def write_file(self, path: str, content: str):
-        return self._run_row(
-            self.logic.write_file_pure(path, content)
-        )
-
-    
     def stat(self, path: str) -> FileStat:
         return self._run_row(
             self.logic.stat_pure(path)
@@ -323,6 +323,8 @@ class MemoryBackend[P, Update, Row, RList](ABC):
         )
 
 
+
+
 class AsyncMemoryBackend[P, Update, Row, RList](ABC):
 
     def __init__(self, logic: PureMemoryBackend[P, Update, Row, RList]):
@@ -347,16 +349,11 @@ class AsyncMemoryBackend[P, Update, Row, RList](ABC):
         ...
 
     async def read_file(self, path: str) -> Optional[str]:
+        """Test-only: read raw file content bypassing path validation and view formatting."""
         return await self._run_row(
             self.logic.read_file_pure(path)
         )
 
-    async def write_file(self, path: str, content: str):
-        return await self._run_row(
-            self.logic.write_file_pure(path, content)
-        )
-
-    
     async def stat(self, path: str) -> FileStat:
         return await self._run_row(
             self.logic.stat_pure(path)
@@ -1050,16 +1047,13 @@ class PureFilesystemLogic(PureMemoryBackend[Never, Never, Never, Never]):
         return f"Removed {path}"
 
 
-
-class FileSystemMemoryBackend(MemoryBackend[Never, Never, Never, Never]):
-    """
-    A simple backend that "mounts" `/memories` to the storage folder given as the constructor arg.
-    """
-    def __init__(self, storage_folder: pathlib.Path, init_from: pathlib.Path | None = None):
-        super().__init__(PureFilesystemLogic(storage_folder))
-        if self._is_empty(storage_folder) and init_from is not None:
-            self._init_from(storage_folder, init_from)
-
+class FileSystemBackendCommon():
+    def __init__(self, mem_root: pathlib.Path, init_from: pathlib.Path | None = None):
+        super().__init__(PureFilesystemLogic(mem_root)) #type: ignore
+        if self._is_empty(mem_root) and init_from is not None:
+            self._init_from(mem_root, init_from)
+        
+    
 
     def _is_empty(self, mem_root: pathlib.Path) -> bool:
         try:
@@ -1082,6 +1076,21 @@ class FileSystemMemoryBackend(MemoryBackend[Never, Never, Never, Never]):
         except StopIteration as e:
             return e.value
 
+
+class FileSystemMemoryBackend(FileSystemBackendCommon, MemoryBackend[Never, Never, Never, Never]):
+    """
+    A simple backend that "mounts" `/memories` to the storage folder given as the constructor arg.
+    """
+    def __init__(self, storage_folder: pathlib.Path, init_from: pathlib.Path | None = None):
+        super().__init__(storage_folder, init_from)
+
+    def _run_all[T](self, d: Generator[Never, Never, T]) -> T:
+        try:
+            next(d)
+            assert False
+        except StopIteration as e:
+            return e.value
+
     @override
     def _run_multi[T](self, d: Generator[Never, Never, T]) -> T:
         return self._run_all(d)
@@ -1092,6 +1101,22 @@ class FileSystemMemoryBackend(MemoryBackend[Never, Never, Never, Never]):
     
     @override
     def _run_update[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
+    
+class AsyncFileMemoryBackend(FileSystemBackendCommon, AsyncMemoryBackend[Never, Never, Never, Never]):
+    def __init__(self, storage_folder: pathlib.Path, init_from: pathlib.Path | None = None):
+        super().__init__(storage_folder, init_from)
+
+    @override
+    async def _run_multi[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
+    
+    @override
+    async def _run_row[T](self, d: Generator[Never, Never, T]) -> T:
+        return self._run_all(d)
+    
+    @override
+    async def _run_update[T](self, d: Generator[Never, Never, T]) -> T:
         return self._run_all(d)
 
 def _memory_tool_impl[R](

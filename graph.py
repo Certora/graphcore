@@ -265,7 +265,7 @@ def _get_summarizer_pure(
         try:
             msg = yield(messages + [HumanMessage(content=summary_prompt, display_tag="summarization")])
             assert isinstance(msg, AIMessage)
-            summary = msg.text()
+            summary = msg.text
             resume_message = config.get_resume_prompt(state, summary)
             config.on_summary(state, summary, resume_message)
             return {

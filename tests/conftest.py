@@ -2,13 +2,16 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from typing import (
-    Any, AsyncIterator, Iterator,
+    Any, AsyncIterator, Awaitable, Iterator,
     Mapping, Protocol, TYPE_CHECKING, cast,
     Generic, TypeVar, Callable
 )
 
 from pydantic import BaseModel
 from typing_extensions import TypedDict, Unpack
+
+import pathlib
+import tempfile
 
 import psycopg
 from psycopg.connection_async import AsyncConnection as AsyncPG
@@ -25,7 +28,8 @@ from langgraph._internal._typing import StateLike
 
 from graphcore.tools.memory import (
     AsyncPostgresBackend,
-    AsyncSQLBackend,
+    FileSystemMemoryBackend,
+    MemoryToolImplForTest,
     PostgresMemoryBackend,
     SqliteMemoryBackend,
     SyncSqlBackend,
@@ -37,6 +41,24 @@ try:
     _HAS_TESTCONTAINERS = True
 except ImportError:
     _HAS_TESTCONTAINERS = False
+
+_MEMORIES_DDL = """
+CREATE TABLE IF NOT EXISTS memories_fs(
+    namespace TEXT NOT NULL,
+    entry_name TEXT NOT NULL,
+    full_path TEXT,
+    parent_path TEXT,
+    is_directory BOOL NOT NULL,
+    contents TEXT,
+    FOREIGN KEY(parent_path, namespace) REFERENCES memories_fs(full_path, namespace) ON DELETE CASCADE,
+    UNIQUE (namespace, full_path),
+    UNIQUE (namespace, parent_path, entry_name),
+    CHECK (parent_path is NOT NULL OR (full_path = '/memories' AND is_directory AND entry_name = 'memories')),
+    CHECK (parent_path is NULL OR (full_path = concat(parent_path, '/', entry_name))),
+    CHECK (contents IS NOT NULL != is_directory)
+);
+CREATE INDEX IF NOT EXISTS memories_namespace_path ON memories_fs(namespace, full_path text_pattern_ops);
+"""
 
 _postgres_param = pytest.param(
     "postgres",
@@ -52,10 +74,8 @@ _postgres_param = pytest.param(
 # Types
 # ---------------------------------------------------------------------------
 
-# MemoryToolImpl covers the tool surface; read_file is the one extra method
-# every test backend needs.
-type AnyBackend = SyncSqlBackend[Any]
-type AnyAsyncBackend = AsyncSQLBackend[Any]
+type AnyBackend = MemoryToolImplForTest[str, str | None]
+type AnyAsyncBackend = MemoryToolImplForTest[Awaitable[str], Awaitable[str | None]]
 
 
 class BackendFactory(Protocol):
@@ -112,12 +132,35 @@ class PostgresFactory:
         real_init = f"{self._prefix}_{init_from}" if init_from else None
         return PostgresMemoryBackend(real_ns, self.conn, real_init)
 
+@dataclass
+class FilesystemFactory:
+    """Creates :class:`FileSystemMemoryBackend` instances in a temp directory."""
+
+    root: pathlib.Path
+    _counter: int = field(default=0, init=False)
+
+    def make(
+        self, ns: str | None = None, init_from: str | None = None
+    ) -> FileSystemMemoryBackend:
+        if ns is None:
+            self._counter += 1
+            ns = str(self._counter)
+        storage = self.root / ns
+        storage.mkdir(parents=True, exist_ok=True)
+        init_path = (self.root / init_from) if init_from is not None else None
+        return FileSystemMemoryBackend(storage, init_path)
+
+
+@pytest.fixture
+def filesystem_factory(tmp_path: pathlib.Path) -> BackendFactory:
+    return FilesystemFactory(tmp_path)
+
+
 @pytest.fixture
 def sqlite_factory() -> Iterator[BackendFactory]:
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     yield SqliteFactory(conn)
     conn.close()
-
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +186,8 @@ def pg_connection(pg_container: PostgresContainer) -> Iterator[psycopg.Connectio
     
     conn_string = f"postgresql://{pg_container.username}:{pg_container.password}@{pg_container.get_container_host_ip()}:{pg_container.get_exposed_port(5432)}/{uniq_db}"
     with psycopg.connect(conn_string) as to_yield:
+        to_yield.execute(_MEMORIES_DDL)
+        to_yield.commit()
         yield to_yield
 
     with psycopg.connect(pg_container.get_connection_url(driver=None), autocommit=True) as conn:
@@ -152,7 +197,7 @@ def pg_connection(pg_container: PostgresContainer) -> Iterator[psycopg.Connectio
 def postgres_factory(pg_connection: psycopg.Connection) -> Iterator[BackendFactory]:
     yield PostgresFactory(pg_connection)
 
-@pytest.fixture(params=["sqlite", _postgres_param])
+@pytest.fixture(params=["filesystem", "sqlite", _postgres_param])
 def factory(request: pytest.FixtureRequest) -> Iterator[BackendFactory]:
     """
     Parameterised factory — every test runs once per backend.
@@ -194,6 +239,31 @@ class AsyncPostgresFactory:
             await to_ret.init_from(real_init)
         return to_ret
 
+@dataclass
+class AsyncFilesystemFactory:
+    path: pathlib.Path
+    _prefix: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    _counter: int = field(default=0, init=False)
+
+    def _to_path(
+        self, ns: str
+    ) -> pathlib.Path:
+        return self.path / ns
+
+    async def make(
+        self, ns: str | None = None, init_from: str | None = None
+    ) -> AsyncFileMemoryBackend:
+        if ns is None:
+            self._counter += 1
+            ns = str(self._counter)
+        real_ns = f"{self._prefix}_{ns}"
+        real_init = f"{self._prefix}_{init_from}" if init_from else None
+        return AsyncFileMemoryBackend(
+            self._to_path(real_ns),
+            self._to_path(real_init) if real_init else None
+        )
+
+
 @pytest_asyncio.fixture
 async def async_pg_connection(
     pg_container: PostgresContainer,
@@ -213,6 +283,8 @@ async def async_pg_connection(
         f":{pg_container.get_exposed_port(5432)}/{uniq_db}"
     )
     aconn = await AsyncPG.connect(conn_string)
+    await aconn.execute(_MEMORIES_DDL)
+    await aconn.commit()
     try:
         yield aconn
     finally:
@@ -223,11 +295,20 @@ async def async_pg_connection(
 
 
 @pytest_asyncio.fixture
-async def async_factory(
+async def async_postgres_factory(
     async_pg_connection: AsyncPG[Any],
 ) -> AsyncBackendFactory:
     return AsyncPostgresFactory(async_pg_connection)
 
+@pytest_asyncio.fixture
+async def async_filesystem_factory(
+    tmp_path: pathlib.Path
+) -> AsyncBackendFactory:
+    return AsyncFilesystemFactory(tmp_path)
+
+@pytest_asyncio.fixture()
+async def async_factory(async_postgres_factory) -> AsyncBackendFactory:
+    return async_postgres_factory
 
 @pytest_asyncio.fixture
 async def async_backend(async_factory: AsyncBackendFactory) -> AnyAsyncBackend:

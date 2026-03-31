@@ -12,20 +12,15 @@ license = {text = "GPL-3.0"}
 authors = [
     {name = "Certora Ltd."}
 ]
-
+ 
 dependencies = [
-    "langchain-core==0.3.79",
-    "langchain==0.3.27",
-    "langchain-anthropic==0.3.21",
-    "langgraph-sdk==0.2.6",
-    "langgraph==0.6.7",
-    "psycopg==3.2.12",
-    "psycopg-binary==3.2.12",
+    "langchain>=1.2",
+    "langchain-anthropic>=1.4",
+    "langchain-core>=1.2",
+    "langgraph>=1.1",
+    "psycopg[binary]>=3.2",
+    "psycopg[pool]>=3.2"
 ]
-
-[tool.setuptools]
-packages = ["graphcore", "graphcore.tools"]
-
-[tool.setuptools.package-dir]
-graphcore = "."
-
+ 
+[tool.setuptools.packages.find]
+include = ["graphcore*"]

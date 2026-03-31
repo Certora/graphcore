@@ -136,6 +136,16 @@ class _ListFileSchemaBase(BaseModel):
     pass
 
 
+class _PutFileSchemaBase(BaseModel):
+    """
+    Put file contents onto the virtual file system used by this workflow.
+    """
+    files: dict[str, str] = \
+        Field(description="A dictionary associating RELATIVE pathnames to the contents to store at those path names. Do NOT include a leading `./` it is always implied. "
+              "The provided contents for the file are durably stored into the virtual filesystem. "
+              "Any files contents with the same path named stored in previous tool calls are overwritten.")
+
+
 class _GrepFileSchemaBase(BaseModel):
     """
     Search for a specific string in the files on the VFS. The output depends on the
@@ -231,6 +241,34 @@ class VFSToolConfig(TypedDict):
     put_doc_extra: NotRequired[str]
     get_doc_extra: NotRequired[str]
 
+class NormalizationError(RuntimeError):
+    pass
+
+def _normalize_and_validate(
+    s: str
+) -> str:
+    res = pathlib.PurePath(s)
+    if ".." in res.parts:
+        raise NormalizationError(f"Invalid path: {s} contains `..`")
+    if res.is_absolute():
+        raise NormalizationError(f"Invalid path: {s} is absolute")
+    return str(res)
+
+from typing_extensions import ParamSpec
+import functools
+
+PS = ParamSpec("PS")
+TOOL_RET = TypeVar("TOOL_RET", str, str | Command)
+
+def handle_path_errors(f: Callable[PS, TOOL_RET]) -> Callable[PS, TOOL_RET]:
+    @functools.wraps(f)
+    def wrapper(*args: PS.args, **kwargs: PS.kwargs) -> TOOL_RET:
+        try:
+            return f(*args, **kwargs)
+        except NormalizationError as e:
+            return f"Tool call failed: {str(e)}" # type: ignore
+    return wrapper
+        
 
 class _VFSAccess(Generic[InputType]):
     def __init__(self, conf: VFSToolConfig):
@@ -285,35 +323,33 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
             )
         return to_ret
 
-    class PutFileSchema(BaseModel):
-        tool_call_id: Annotated[str, InjectedToolCallId]
-
-        files: dict[str, str] = \
-            Field(description="A dictionary associating RELATIVE pathnames to the contents to store at those path names. Do NOT include a leading `./` it is always implied. "
-                  "The provided contents for the file are durably stored into the virtual filesystem. "
-                  "Any files contents with the same path named stored in previous tool calls are overwritten.")
-
-    pf_doc = "Put file contents onto the virtual file system used by this workflow."
+    pf_doc = _PutFileSchemaBase.__doc__ or ""
     if "put_doc_extra" in conf:
         pf_doc += f"\n\n{conf['put_doc_extra']}"
 
-    PutFileSchema.__doc__ = pf_doc
+    class PutFileSchema(_PutFileSchemaBase):
+        __doc__ = pf_doc
+        tool_call_id: Annotated[str, InjectedToolCallId]
 
     put_filter = _make_checker(conf.get("forbidden_write"))
     get_filter = _make_checker(conf.get("forbidden_read"))
 
     @tool(args_schema=PutFileSchema)
+    @handle_path_errors
     def put_file(
         files: dict[str, str],
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> str | Command:
-        for (k, _) in files.items():
-            if not put_filter(k):
+        to_update = {}
+        for (k, upd) in files.items():
+            norm_path = _normalize_and_validate(k)
+            if not put_filter(norm_path):
                 return f"Illegal put operation: cannot write {k} on the VFS"
+            to_update[norm_path] = upd
         return tool_output(
             tool_call_id=tool_call_id,
             res={
-                "vfs": files
+                "vfs": to_update
             }
         )
     
@@ -344,12 +380,14 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         pass
 
     @tool(args_schema=GetFileSchema)
+    @handle_path_errors
     def get_file(
         path: str,
         state: Annotated[InputType, InjectedState],
         range: FileRange | None = None
     ) -> str:
-        cont = _get_content(state, path)
+        norm_path = _normalize_and_validate(path)
+        cont = _get_content(state, norm_path)
         return _get_file(cont, range)
 
     @cache
@@ -447,10 +485,12 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing:
         pass
 
     @tool(args_schema=GetFileSchema)
+    @handle_path_errors
     def get_file(path: str, range: FileRange | None = None) -> str:
-        if not check_allowed(path):
+        norm_path = _normalize_and_validate(path)
+        if not check_allowed(norm_path):
             return "File not found"
-        child = base_path / path
+        child = base_path / norm_path
         if child.is_file():
             try:
                 return _get_file(child.read_text(), range)
