@@ -22,9 +22,11 @@ dependencies = [
     "psycopg[pool]>=3.2"
 ]
  
-[tool.setuptools.packages.find]
-include = ["graphcore*"]
-
 [dependency-groups]
 test = ["pytest>=9.0", "pytest-asyncio>=1.3", "testcontainers>=4.0"]
 ci = ["pyright"]
+
+[tool.setuptools]
+packages = ["graphcore", "graphcore.tools"]
+package-dir = {"graphcore" = "."}
+

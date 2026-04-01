@@ -924,6 +924,7 @@ class AsyncPostgresBackend(AsyncSQLBackend[AsyncConnectionPool | AsyncConnection
 class SqliteMemoryBackend(SyncSqlBackend[sqlite3.Connection]):
     def __init__(self, ns: str, conn: sqlite3.Connection, init_from: str | None = None):
         super().__init__(conn, init_from, SqliteBackendPure(ns))
+        self.conn_lock = Lock()
 
     @contextmanager
     def _cursor(self) -> Iterator[DBCursor]:
@@ -933,12 +934,13 @@ class SqliteMemoryBackend(SyncSqlBackend[sqlite3.Connection]):
         Paper over this difference, so that when `with self._cursor()` exits
         the transaction is committed (or rolled back) and the cursor is closed.
         """
-        with self.conn:
-            cur = self.conn.cursor()
-            try:
-                yield cur
-            finally:
-                cur.close()
+        with self.conn_lock:
+            with self.conn:
+                cur = self.conn.cursor()
+                try:
+                    yield cur
+                finally:
+                    cur.close()
 
     @override
     def _setup(self):

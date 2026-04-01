@@ -8,10 +8,9 @@ from typing import (
 )
 
 from pydantic import BaseModel
-from typing_extensions import TypedDict, Unpack
+from typing_extensions import TypedDict
 
 import pathlib
-import tempfile
 
 import psycopg
 from psycopg.connection_async import AsyncConnection as AsyncPG
@@ -32,7 +31,6 @@ from graphcore.tools.memory import (
     MemoryToolImplForTest,
     PostgresMemoryBackend,
     SqliteMemoryBackend,
-    SyncSqlBackend,
 )
 
 try:
