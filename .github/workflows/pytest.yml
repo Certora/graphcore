@@ -7,7 +7,7 @@ on:
     branches: [ main, master ]
 
 jobs:
-  pyright:
+  pytest:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
@@ -22,6 +22,6 @@ jobs:
         run: |
           uv sync --group test --group ci
 
-      - name: Run pyright
+      - name: Run pytest
         run: |
           uv run pytest tests/

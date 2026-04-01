@@ -28,5 +28,3 @@ ci = ["pyright"]
 
 [tool.setuptools]
 packages = ["graphcore", "graphcore.tools"]
-package-dir = {"graphcore" = "."}
-

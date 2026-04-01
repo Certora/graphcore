@@ -167,7 +167,7 @@ def sqlite_factory() -> Iterator[BackendFactory]:
 
 
 @pytest.fixture(scope="session")
-def pg_container() -> Iterator[PostgresContainer]:
+def pg_container() -> Iterator["PostgresContainer"]:
     """Start a Postgres container once per session and yield a conninfo URI."""
     if not _HAS_TESTCONTAINERS:
         pytest.skip("testcontainers not installed")
@@ -175,7 +175,7 @@ def pg_container() -> Iterator[PostgresContainer]:
         yield pg  
 
 @pytest.fixture
-def pg_connection(pg_container: PostgresContainer) -> Iterator[psycopg.Connection]:
+def pg_connection(pg_container: "PostgresContainer") -> Iterator[psycopg.Connection]:
     uniq_db = "test_" + uuid.uuid4().hex[:16]
     from psycopg.sql import SQL, Identifier
 
@@ -239,7 +239,7 @@ class AsyncPostgresFactory:
 
 @pytest_asyncio.fixture
 async def async_pg_connection(
-    pg_container: PostgresContainer,
+    pg_container: "PostgresContainer",
 ) -> AsyncIterator[AsyncPG[Any]]:
     """Per-test async connection to a throwaway database."""
     uniq_db = "test_async_" + uuid.uuid4().hex[:16]

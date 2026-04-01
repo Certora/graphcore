@@ -923,8 +923,9 @@ class AsyncPostgresBackend(AsyncSQLBackend[AsyncConnectionPool | AsyncConnection
 
 class SqliteMemoryBackend(SyncSqlBackend[sqlite3.Connection]):
     def __init__(self, ns: str, conn: sqlite3.Connection, init_from: str | None = None):
-        super().__init__(conn, init_from, SqliteBackendPure(ns))
         self.conn_lock = Lock()
+        super().__init__(conn, init_from, SqliteBackendPure(ns))
+
 
     @contextmanager
     def _cursor(self) -> Iterator[DBCursor]:
