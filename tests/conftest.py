@@ -239,31 +239,6 @@ class AsyncPostgresFactory:
             await to_ret.init_from(real_init)
         return to_ret
 
-@dataclass
-class AsyncFilesystemFactory:
-    path: pathlib.Path
-    _prefix: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    _counter: int = field(default=0, init=False)
-
-    def _to_path(
-        self, ns: str
-    ) -> pathlib.Path:
-        return self.path / ns
-
-    async def make(
-        self, ns: str | None = None, init_from: str | None = None
-    ) -> AsyncFileMemoryBackend:
-        if ns is None:
-            self._counter += 1
-            ns = str(self._counter)
-        real_ns = f"{self._prefix}_{ns}"
-        real_init = f"{self._prefix}_{init_from}" if init_from else None
-        return AsyncFileMemoryBackend(
-            self._to_path(real_ns),
-            self._to_path(real_init) if real_init else None
-        )
-
-
 @pytest_asyncio.fixture
 async def async_pg_connection(
     pg_container: PostgresContainer,
@@ -299,12 +274,6 @@ async def async_postgres_factory(
     async_pg_connection: AsyncPG[Any],
 ) -> AsyncBackendFactory:
     return AsyncPostgresFactory(async_pg_connection)
-
-@pytest_asyncio.fixture
-async def async_filesystem_factory(
-    tmp_path: pathlib.Path
-) -> AsyncBackendFactory:
-    return AsyncFilesystemFactory(tmp_path)
 
 @pytest_asyncio.fixture()
 async def async_factory(async_postgres_factory) -> AsyncBackendFactory:

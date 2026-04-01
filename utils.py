@@ -13,8 +13,8 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import List, cast
-from langchain_core.messages import BaseMessage, AnyMessage, HumanMessage, ToolMessage
+from typing import List, cast, TypedDict, Literal
+from langchain_core.messages import BaseMessage, AnyMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.runnables import Runnable
 
@@ -98,4 +98,34 @@ async def acached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[A
     """
     canon = add_cache_control(s)
     to_ret = await b.ainvoke(canon)
+    return to_ret
+
+type TokenUsageKeysT = Literal[
+    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
+]
+
+_token_usage_keys : list[TokenUsageKeysT] = [
+    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
+]
+
+class TokenUsageDict(TypedDict):
+    """Dictionary for accumulating token usage across LLM calls."""
+    input_tokens: int
+    output_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+
+def get_token_usage(m: AIMessage) -> TokenUsageDict:
+    to_ret : TokenUsageDict = {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0
+    }
+    rm = m.response_metadata
+    for k in _token_usage_keys:
+        tok = rm.get(k, 0)
+        if not isinstance(tok, int):
+            continue # be cool
+        to_ret[k] = to_ret[k] + tok
     return to_ret
