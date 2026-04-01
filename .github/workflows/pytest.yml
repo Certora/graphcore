@@ -5,10 +5,23 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-    
+
 jobs:
-  pyright:
+  pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: ./.github/actions/setup
-      - run: uv run pytest
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      
+      - name: sync-deps
+        run: |
+          uv sync --group test --group ci
+
+      - name: Run pytest
+        run: |
+          uv run pytest tests/
