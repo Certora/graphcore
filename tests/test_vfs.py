@@ -7,8 +7,7 @@ import pytest
 from langgraph.graph import MessagesState
 
 from graphcore.tools.vfs import vfs_tools, VFSState, VFSToolConfig
-
-from .conftest import Scenario, tool_call_raw, ToolCallDict
+from graphcore.testing import Scenario, tool_call_raw, ToolCallDict
 
 pytestmark = pytest.mark.asyncio
 
