@@ -269,7 +269,7 @@ def _get_summarizer_pure(
             resume_message = config.get_resume_prompt(state, summary)
             config.on_summary(state, summary, resume_message)
             # Handle initial_prompt as either str or dict (with cache_control)
-            initial_content: str | list[str | dict] = [initial_prompt] if isinstance(initial_prompt, dict) else initial_prompt
+            initial_content: list[str | dict] = [initial_prompt]
             return {
                 "messages": [
                     RemoveMessage(id="__remove_all__"),
