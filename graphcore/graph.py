@@ -265,7 +265,7 @@ def _get_summarizer_pure(
         try:
             msg = yield(messages + [HumanMessage(content=summary_prompt, display_tag="summarization")])
             assert isinstance(msg, AIMessage)
-            summary = msg.text()
+            summary = msg.text
             resume_message = config.get_resume_prompt(state, summary)
             config.on_summary(state, summary, resume_message)
             return {
@@ -458,6 +458,7 @@ class Builder(
         self._tools : list[BaseTool | SplitTool] = []
         self._loader : TemplateLoader | None = None
         self._conversation_handler : AnyChatNodeFunction[_BStateT] | None = None
+        self._checkpointer : None | Checkpointer = None
 
     def _copy_untyped_to_(self, other: "Builder[Any, Any, Any]"):
         other._initial_prompt = self._initial_prompt
@@ -466,6 +467,7 @@ class Builder(
         other._output_key = self._output_key
         other._tools.extend(self._tools)
         other._loader = self._loader
+        other._checkpointer = self._checkpointer
 
     def _copy_typed_to(self, other: "Builder[_BStateT, _BContextT, _BInputT]"):
         other._state_class = self._state_class
@@ -491,6 +493,19 @@ class Builder(
         to_ret._summary_config = self._summary_config
         to_ret._conversation_handler = self._conversation_handler
         return to_ret
+    
+    def with_checkpointer(self, checkpointer: Checkpointer) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        to_ret : "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_typed_to(to_ret)
+        self._copy_untyped_to_(to_ret)
+        to_ret._checkpointer = checkpointer
+        return to_ret
+    
+    def inject[OInput: FlowInput|None, OState: MessagesState | None, OCtxt: StateLike | None](
+        self,
+        f: Callable[["Builder[_BStateT, _BContextT, _BInputT]"], "Builder[OState, OCtxt, OInput]"]
+    ) -> "Builder[OState, OCtxt, OInput]":
+        return f(self)
 
     def with_input(self, t: type[_BInputTBind]) -> "Builder[_BStateT, _BContextT, _BInputTBind]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputTBind]" = Builder()
@@ -625,13 +640,15 @@ class Builder(
         self, *,
         checkpointer: Checkpointer = None
     ) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        check = checkpointer if checkpointer else self._checkpointer
         return self.build_async()[0].compile(
-            checkpointer=checkpointer
+            checkpointer=check
         )
 
     def compile(self, checkpointer: Checkpointer = None) -> CompiledStateGraph[_BStateT, _BContextT, _BInputT, Any]: #type: ignore
+        check = checkpointer if checkpointer else self._checkpointer
         return self.build()[0].compile(
-            checkpointer=checkpointer
+            checkpointer=check
         )
 
 def build_workflow(
