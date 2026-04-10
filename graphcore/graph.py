@@ -26,6 +26,7 @@ from langgraph.types import Checkpointer
 from langgraph._internal._typing import StateLike
 from langgraph.types import Command, interrupt
 from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt.tool_node import ToolInvocationError
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
 from .utils import cached_invoke, acached_invoke
@@ -794,7 +795,7 @@ def _build_workflow(
 
     # Create initial node and tool node with curried LLM
     init_node = init_fact(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
-    tool_node = ToolNode(tool_impls, handle_tool_errors=(ValidationError,))
+    tool_node = ToolNode(tool_impls, handle_tool_errors=(ValidationError,ToolInvocationError))
     tool_result_node = result_fact(state_class, llm)
 
     # Build the graph with fixed input schema, no context
