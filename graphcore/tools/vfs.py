@@ -160,9 +160,12 @@ class _GrepFileSchemaBase(BaseModel):
     In both output modes, empty lines should be ignored.
 
     In both modes, the paths to search can be restricted with `match_in`.
+
+    IMPORTANT: This tool searches file *contents*, NOT their names. DO NOT use this tool to search for files
+    whose name make a regex, it will not work.
     """
 
-    search_string: str = Field(description="The query string to search for provided as a python regex. Thus, you must escape any special characters (like [, |, etc.)")
+    search_string: str = Field(description="The query string to search for provided as is as an input to a python regex.")
     matching_lines: bool = Field(description="If true, show the matching lines and the line number; if false, simply list the matching files")
     match_in: list[str] | None = Field(description="If set, narrow the search to only the paths listed here.", default=None)
 

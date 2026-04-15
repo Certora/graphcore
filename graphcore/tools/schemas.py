@@ -23,7 +23,7 @@ class WithInjectedId(BaseModel):
 class WithImplementation(BaseModel, Generic[T_RES]):
     def run(self) -> T_RES:
         """Override this method to implement the tool logic."""
-        raise NotImplementedError("Subclasses must implement run()")
+        raise NotImplementedError(f"Subclasses ({type(self)}) must implement run()")
     
     @classmethod
     def as_tool(
@@ -47,7 +47,7 @@ class WithImplementation(BaseModel, Generic[T_RES]):
 class WithAsyncImplementation(BaseModel, Generic[T_RES]):
     async def run(self) -> T_RES:
         """Override this method to implement the tool logic."""
-        raise NotImplementedError("Subclasses must implement run()")
+        raise NotImplementedError(f"Subclasses {type(self)} must implement run()")
     
     @classmethod
     def as_tool(
