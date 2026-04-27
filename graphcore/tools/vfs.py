@@ -51,6 +51,52 @@ def _make_checker(patt: str | None) -> Callable[[str], bool]:
     match = re.compile(patt)
     return lambda f_name: match.fullmatch(f_name) is None
 
+
+# Always-on exclude floor. ``.git`` is never useful for any consumer
+# (VFS tools, materialization, audit) — including it is pure waste at
+# best and actively misleading at worst (every workflow would re-snapshot
+# megabytes of history). User-supplied ``global_exclude`` patterns and
+# predicates union on top of this floor.
+
+
+def _floor_include(path: str) -> bool:
+    """``.git`` directory and contents are always excluded. True if the
+    path passes the floor (i.e. is NOT under .git anywhere in its path
+    parts; covers root .git, nested .git from submodules, etc.)."""
+    return ".git" not in pathlib.PurePosixPath(path).parts
+
+
+# Type alias for the user-facing ``global_exclude`` config. Both forms
+# return True to *exclude* the path. The callable form (preferred) is
+# more natural when the predicate cares about Path semantics like
+# ``suffix`` or ``parts``; the regex form is retained for symmetry with
+# ``forbidden_read``/``forbidden_write`` but is clunky for path logic
+# (you end up writing ``(.*/)?node_modules(/.*)?`` for what's just
+# ``"node_modules" in p.parts``).
+type GlobalExcludeArg = str | Callable[[pathlib.PurePath], bool] | None
+
+
+def _make_global_include_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
+    """Returns an *include* predicate (True = okay to access) that
+    composes the always-on ``.git`` floor with the user-supplied
+    exclusion (if any).
+
+    Polarity matches ``_make_checker``: True means the path is
+    accessible. The user-facing argument is named ``global_exclude``
+    because the user thinks in terms of "what to exclude"; the
+    polarity flip happens here at the boundary so internal predicate
+    composition stays consistent.
+    """
+    if arg is None:
+        return _floor_include
+    if isinstance(arg, str):
+        rx = re.compile(arg)
+        # fullmatch for symmetry with forbidden_read/forbidden_write.
+        return lambda p: _floor_include(p) and rx.fullmatch(p) is None
+    # Callable form: caller's predicate returns True to exclude. We flip.
+    user_excludes = arg
+    return lambda p: _floor_include(p) and not user_excludes(pathlib.PurePosixPath(p))
+
 class FileRange(BaseModel):
     start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
     end_line: int = Field(description="The line to read until EXCLUSIVE.")
@@ -214,12 +260,15 @@ def debugging_tmp_directory() -> Iterator[str]:
 def _materialize(
     provider: TempDirectoryProvider,
     fs_layer: str | None,
-    state: VFSState
+    state: VFSState,
+    include_path: Callable[[str], bool],
 ) -> Iterator[str]:
     with provider() as dir:
         files = state["vfs"]
         target = pathlib.Path(dir)
         for (k, v) in files.items():
+            if not include_path(k):
+                continue
             tgt = target / k
             tgt.parent.mkdir(exist_ok=True, parents=True)
             tgt.write_text(v)
@@ -230,6 +279,8 @@ def _materialize(
                 if not p.is_file():
                     continue
                 rel_path = p.relative_to(mounted_path)
+                if not include_path(str(rel_path)):
+                    continue
                 copy_path = target / rel_path
                 if copy_path.exists():
                     continue
@@ -243,6 +294,13 @@ class VFSToolConfig(TypedDict):
     fs_layer: NotRequired[str | None]
     forbidden_read: NotRequired[str]
     forbidden_write: NotRequired[str]
+
+    # Paths invisible to every consumer (tools, materialization, audit).
+    # Either a fullmatch regex (BC; clunky for path logic) or a
+    # ``Callable[[PurePath], bool]`` returning True to exclude
+    # (preferred). ``.git`` is always excluded; this composes on top.
+    # See ``fs_tools_layered`` for the contract.
+    global_exclude: NotRequired[GlobalExcludeArg]
 
     put_doc_extra: NotRequired[str]
     get_doc_extra: NotRequired[str]
@@ -277,16 +335,31 @@ def handle_path_errors(f: Callable[PS, TOOL_RET]) -> Callable[PS, TOOL_RET]:
         
 
 class _VFSAccess(Generic[InputType]):
-    def __init__(self, conf: VFSToolConfig):
+    def __init__(
+        self,
+        conf: VFSToolConfig,
+        global_include: Callable[[str], bool],
+    ):
         self.conf = conf
+        # Single global-include predicate (True = okay to access),
+        # consistent in polarity with ``_make_checker``. Composed by
+        # the parent factory and shared with the tool closures so we
+        # don't rebuild the regex per call AND there's no chance of
+        # one site forgetting to consult it.
+        self._global_include = global_include
 
     def materialize(self, state: InputType, debug: bool = False) -> ContextManager[str]:
         manager : TempDirectoryProvider = tempfile.TemporaryDirectory
         if debug:
             manager = debugging_tmp_directory
-        return _materialize(manager, self.conf.get("fs_layer"), state)
+        return _materialize(
+            manager, self.conf.get("fs_layer"), state,
+            include_path=self._global_include,
+        )
 
     def get(self, state: InputType, file: str) -> bytes | None:
+        if not self._global_include(file):
+            return None
         if file in state["vfs"]:
             return state["vfs"][file].encode("utf-8")
         fs_layer = self.conf.get("fs_layer", None)
@@ -301,6 +374,8 @@ class _VFSAccess(Generic[InputType]):
     def iterate(self, state: InputType) -> Iterator[tuple[str, bytes]]:
         d = state["vfs"]
         for (p, v) in d.items():
+            if not self._global_include(p):
+                continue
             yield (p, v.encode("utf-8"))
 
         if (fs_layer := self.conf.get("fs_layer", None)) is not None:
@@ -309,9 +384,12 @@ class _VFSAccess(Generic[InputType]):
                 if not child.is_file():
                     continue
                 rel_path = child.relative_to(root)
-                if str(rel_path) in d:
+                rel_str = str(rel_path)
+                if not self._global_include(rel_str):
                     continue
-                yield (str(rel_path), child.read_bytes())
+                if rel_str in d:
+                    continue
+                yield (rel_str, child.read_bytes())
 
 
 def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool], VFSAccessor[InputType]]:
@@ -337,8 +415,20 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         __doc__ = pf_doc
         tool_call_id: Annotated[str, InjectedToolCallId]
 
-    put_filter = _make_checker(conf.get("forbidden_write"))
-    get_filter = _make_checker(conf.get("forbidden_read"))
+    # Single global-include predicate (True = okay to access) compiled
+    # once and folded into the read/write filters below. Sharing avoids
+    # rebuilding the regex per call AND removes the "remember to also
+    # check the global exclude" foot-gun — every site only consults
+    # ``can_read`` / ``can_write``.
+    global_include = _make_global_include_pred(conf.get("global_exclude"))
+    forbidden_write_chk = _make_checker(conf.get("forbidden_write"))
+    forbidden_read_chk = _make_checker(conf.get("forbidden_read"))
+    can_write: Callable[[str], bool] = (
+        lambda p: forbidden_write_chk(p) and global_include(p)
+    )
+    can_read: Callable[[str], bool] = (
+        lambda p: forbidden_read_chk(p) and global_include(p)
+    )
 
     @tool(args_schema=PutFileSchema)
     @handle_path_errors
@@ -349,7 +439,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         to_update = {}
         for (k, upd) in files.items():
             norm_path = _normalize_and_validate(k)
-            if not put_filter(norm_path):
+            if not can_write(norm_path):
                 return f"Illegal put operation: cannot write {k} on the VFS"
             to_update[norm_path] = upd
         return tool_output(
@@ -358,8 +448,16 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 "vfs": to_update
             }
         )
-    
+
     def _get_content_raw(s: InputType, path: str) -> str | None:
+        # Note: ``can_read`` is enforced upstream in ``_get_content`` and
+        # ``_list_files``; this helper is the raw underlay reader.
+        # ``global_include`` is still checked here because callers
+        # (e.g. ``grep_files`` via ``_get_content_raw``) bypass
+        # ``can_read``'s ``forbidden_read`` filter but must NEVER see
+        # globally-excluded paths.
+        if not global_include(path):
+            return None
         vfs = s["vfs"]
         if path not in vfs:
             layer = conf.get("fs_layer", None)
@@ -374,9 +472,9 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 return None
         else:
             return vfs[path]
-    
+
     def _get_content(s: InputType, path: str) -> str | None:
-        if not get_filter(path):
+        if not can_read(path):
             return None
         return _get_content_raw(s, path)
 
@@ -413,11 +511,11 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
         state: InputType
     ) -> Iterator[str]:
         for (k, _) in state["vfs"].items():
-            if not get_filter(k):
+            if not can_read(k):
                 continue
             yield k
         for f_name in list_underlying():
-            if not get_filter(f_name) or f_name in state["vfs"]:
+            if not can_read(f_name) or f_name in state["vfs"]:
                 continue
             yield f_name
 
@@ -453,7 +551,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     if not conf["immutable"]:
         tools.append(put_file)
 
-    materializer = _VFSAccess[InputType](conf=conf)
+    materializer = _VFSAccess[InputType](conf=conf, global_include=global_include)
 
     return (tools, materializer)
 
@@ -465,6 +563,19 @@ class FSBackend(Protocol):
     not present in this backend. ``list`` enumerates every path this backend
     can serve. ``dump_to`` writes every file the backend serves into
     ``target`` so downstream tools (e.g. solc) can read them from disk.
+
+    ``dump_to`` accepts an optional ``include_path`` predicate; when set,
+    only paths for which ``include_path(path)`` returns ``True`` are
+    written to ``target``. ``None`` (the default) writes every file.
+    Backends should honor the predicate efficiently when possible (e.g.
+    ``DirBackend`` passes it through to ``shutil.copytree``'s ``ignore``
+    argument so excluded directory subtrees are short-circuited at the
+    root rather than recursed into and filtered file-by-file).
+
+    The predicate is the implementation primitive used by callers like
+    ``_LayeredMaterializer`` to enforce ``global_exclude`` patterns
+    uniformly across every backend in a stack — but the filter itself
+    is general and not tied to that one use case.
     """
 
     def get(self, path: str) -> str | None:
@@ -473,7 +584,11 @@ class FSBackend(Protocol):
     def list(self) -> Iterable[str]:
         ...
 
-    async def dump_to(self, target: pathlib.Path) -> None:
+    async def dump_to(
+        self,
+        target: pathlib.Path,
+        include_path: Callable[[str], bool] | None = None,
+    ) -> None:
         ...
 
 
@@ -533,10 +648,30 @@ class DirBackend:
             self._cached = self._enumerate()
         return self._cached
 
-    async def dump_to(self, target: pathlib.Path) -> None:
+    async def dump_to(
+        self,
+        target: pathlib.Path,
+        include_path: Callable[[str], bool] | None = None,
+    ) -> None:
+        root = self.root
+        if include_path is None:
+            ignore = None
+        else:
+            # Adapt the predicate to ``shutil.copytree``'s ``ignore``
+            # callback. The callback is invoked once per directory; we
+            # relativize ``src`` back to ``self.root`` so the predicate
+            # sees the same project-relative paths it does in ``list``
+            # and ``get``. Returning a name in the ignore list short-
+            # circuits the entire subtree at that point.
+            def _ignore(src: str, names: list[str]) -> list[str]:
+                src_rel = pathlib.Path(src).relative_to(root)
+                prefix = "" if str(src_rel) == "." else f"{src_rel}/"
+                return [n for n in names if not include_path(f"{prefix}{n}")]
+            ignore = _ignore
+
         def _copy() -> None:
             target.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(self.root, target, dirs_exist_ok=True)
+            shutil.copytree(root, target, dirs_exist_ok=True, ignore=ignore)
         await asyncio.to_thread(_copy)
 
 
@@ -547,16 +682,34 @@ class _LayeredMaterializer:
     (earlier in the list) backends' writes overwrite on collision. This
     preserves the first-hit read semantics of ``fs_tools_layered`` at
     materialization time.
+
+    ``global_exclude`` (regex) defines paths that are invisible to every
+    consumer — VFS tools, materialization, and (transitively) any
+    downstream the materializer feeds (audit DB, prover, typecheck).
+    Distinct from ``forbidden_read``, which only filters the agent's
+    tool surface and lets materialization through. ``.git`` is hardcoded
+    into the exclude floor; the user pattern unions on top.
     """
 
-    def __init__(self, backends: Sequence[FSBackend]) -> None:
+    def __init__(
+        self,
+        backends: Sequence[FSBackend],
+        global_exclude: GlobalExcludeArg = None,
+    ) -> None:
         self._backends = list(backends)
+        # Single include predicate (True = okay to access). Polarity
+        # matches ``_make_checker`` and ``FSBackend.dump_to``'s
+        # ``include_path`` parameter, so backends and tool closures
+        # consume the same shape.
+        self._include: Callable[[str], bool] = _make_global_include_pred(global_exclude)
 
     async def dump_to(self, target: pathlib.Path) -> None:
         for backend in reversed(self._backends):
-            await backend.dump_to(target)
+            await backend.dump_to(target, include_path=self._include)
 
     def get(self, path: str) -> str | None:
+        if not self._include(path):
+            return None
         for backend in self._backends:
             content = backend.get(path)
             if content is not None:
@@ -567,22 +720,45 @@ class _LayeredMaterializer:
 def fs_tools_layered(
     backends: Sequence[FSBackend],
     forbidden_read: str | None = None,
+    global_exclude: GlobalExcludeArg = None,
 ) -> tuple[list[BaseTool], Materializer]:
     """Create stateless read-only filesystem tools over a layered backend stack.
 
     ``backends`` are consulted in priority order (first wins) for ``get``,
-    and unioned (with de-duplication by path) for ``list``. ``forbidden_read``
-    filters the tool-visible view only; the returned materializer always
-    dumps every file so downstream consumers (e.g. solc) see a complete tree.
+    and unioned (with de-duplication by path) for ``list``.
+
+    ``forbidden_read`` (fullmatch regex) filters the agent-facing tool
+    surface only — ``get_file``/``list_files``/``grep_files``. The
+    materializer still dumps every non-globally-excluded file so
+    downstream consumers (e.g. solc) see a complete tree.
+
+    ``global_exclude`` filters every consumer — the tool surface, the
+    materializer, and (transitively) anyone the materializer feeds
+    (audit DB, prover). Accepts either a fullmatch regex (BC; clunky
+    for path logic) or a ``Callable[[PurePath], bool]`` returning True
+    to exclude (preferred). The ``.git`` directory is always excluded;
+    the user pattern/predicate composes on top.
 
     Returns ``(tools, materializer)``. ``tools`` is the usual
     ``[get_file, list_files, grep_files]``; ``materializer`` dumps the
-    composite view into a caller-provided directory, honoring layer priority.
+    composite view into a caller-provided directory, honoring layer
+    priority and the global exclude.
     """
-    check_allowed = _make_checker(forbidden_read)
+    # Single fold: tool-surface readability is "forbidden_read allows
+    # AND not globally excluded". One predicate = no foot-gun about
+    # remembering to also check the global exclude at every call site.
+    forbidden_chk = _make_checker(forbidden_read)
+    global_include = _make_global_include_pred(global_exclude)
+    can_read: Callable[[str], bool] = lambda p: forbidden_chk(p) and global_include(p)
     backend_list = list(backends)
 
     def _lookup_unfiltered(path: str) -> str | None:
+        # ``forbidden_read`` is tool-only; the materializer's existence
+        # check and similar paths use this unfiltered hook. We still
+        # short-circuit on ``global_include`` because globally excluded
+        # paths must be invisible to *every* consumer including this one.
+        if not global_include(path):
+            return None
         for backend in backend_list:
             content = backend.get(path)
             if content is not None:
@@ -590,9 +766,13 @@ def fs_tools_layered(
         return None
 
     def _lookup(path: str) -> str | None:
-        if not check_allowed(path):
+        if not can_read(path):
             return None
-        return _lookup_unfiltered(path)
+        for backend in backend_list:
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
 
     def _enumerate() -> Iterator[str]:
         seen: set[str] = set()
@@ -601,7 +781,7 @@ def fs_tools_layered(
                 if path in seen:
                     continue
                 seen.add(path)
-                if not check_allowed(path):
+                if not can_read(path):
                     continue
                 yield path
 
@@ -648,10 +828,16 @@ def fs_tools_layered(
         )
 
     tools: list[BaseTool] = [get_file, list_files, grep_files]
-    return tools, _LayeredMaterializer(backend_list)
+    return tools, _LayeredMaterializer(backend_list, global_exclude=global_exclude)
 
 
-def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing: bool = True) -> list[BaseTool]:
+def fs_tools(
+    fs_layer: str,
+    forbidden_read: str | None = None,
+    *,
+    cache_listing: bool = True,
+    global_exclude: GlobalExcludeArg = None,
+) -> list[BaseTool]:
     """
     Create stateless file system tools that operate directly on a directory.
 
@@ -664,10 +850,18 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing:
         forbidden_read: Optional regex pattern for paths that cannot be read
         cache_listing: If True (default), cache the directory listing after first call.
             Set to False if the agent needs to react to filesystem changes.
+        global_exclude: Optional fullmatch regex for paths invisible to *every*
+            consumer (tools, materialization, audit). ``.git`` is always
+            excluded; this pattern unions on top. See
+            ``fs_tools_layered`` for the full contract.
 
     Returns:
         List of tools: [get_file, list_files, grep_files]
     """
     backend = DirBackend(pathlib.Path(fs_layer), cache_listing=cache_listing)
-    tools, _ = fs_tools_layered([backend], forbidden_read=forbidden_read)
+    tools, _ = fs_tools_layered(
+        [backend],
+        forbidden_read=forbidden_read,
+        global_exclude=global_exclude,
+    )
     return tools
