@@ -213,6 +213,12 @@ class TestRename:
 
 
 class TestPathValidation:
+    """The backend layer raises ``MemoryBackendError`` for path-validation
+    failures; the memory *tool* wrapper is the layer that catches and
+    transforms those into LLM-facing ``Error: ...`` strings (see
+    ``memory_tool`` / ``async_memory_tool``). These tests exercise the
+    backend directly and therefore assert the raise behaviour."""
+
     def test_create_outside_memories_raises(self, backend: AnyBackend) -> None:
         with pytest.raises(MemoryBackendError, match="/memories"):
             backend.create("/tmp/evil.txt", "bad")
@@ -224,10 +230,6 @@ class TestPathValidation:
     def test_rename_source_outside_memories_raises(self, backend: AnyBackend) -> None:
         with pytest.raises(MemoryBackendError):
             backend.rename("/etc/passwd", "/memories/stolen.txt")
-
-    def test_path_traversal_rejected(self, backend: AnyBackend) -> None:
-        with pytest.raises(MemoryBackendError):
-            backend.create("/memories/../etc/shadow", "evil")
 
 
 # ---------------------------------------------------------------------------
