@@ -14,8 +14,11 @@
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing_extensions import TypedDict
-from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Sequence, ContextManager, Protocol, Iterator, Generic
+from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Iterable, Sequence, ContextManager, Protocol, Iterator, Generic
+import asyncio
 import re
+import shutil
+from dataclasses import dataclass, field
 from functools import cache
 import pathlib
 import contextlib
@@ -455,6 +458,199 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     return (tools, materializer)
 
 
+class FSBackend(Protocol):
+    """A read-only filesystem-like source.
+
+    ``get`` returns the text contents at ``path`` or ``None`` if the path is
+    not present in this backend. ``list`` enumerates every path this backend
+    can serve. ``dump_to`` writes every file the backend serves into
+    ``target`` so downstream tools (e.g. solc) can read them from disk.
+    """
+
+    def get(self, path: str) -> str | None:
+        ...
+
+    def list(self) -> Iterable[str]:
+        ...
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        ...
+
+
+class Materializer(Protocol):
+    """Writes a composite filesystem view into a real on-disk directory.
+
+    Typically the caller creates a tmpdir and passes it as ``target``. The
+    materializer is responsible for honoring layering order: higher-priority
+    backends overwrite lower-priority ones so the disk layout matches what
+    ``fs_tools_layered`` reads would see.
+
+    ``get`` is a single-file query against the same composite view used by
+    ``dump_to``; returns the file's content (first-hit across layers in
+    priority order) or ``None`` if no layer serves the path. This is the
+    unfiltered view — ``forbidden_read`` only affects the tool surface, not
+    materialization or existence queries.
+    """
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        ...
+
+    def get(self, path: str) -> str | None:
+        ...
+
+
+@dataclass
+class DirBackend:
+    """``FSBackend`` adapter over a real on-disk directory."""
+
+    root: pathlib.Path
+    cache_listing: bool = True
+    _cached: list[str] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.root = pathlib.Path(self.root)
+
+    def _enumerate(self) -> list[str]:
+        return [
+            str(f.relative_to(self.root))
+            for f in self.root.rglob("*")
+            if f.is_file()
+        ]
+
+    def get(self, path: str) -> str | None:
+        child = self.root / path
+        if not child.is_file():
+            return None
+        try:
+            return child.read_text()
+        except Exception:
+            return None
+
+    def list(self) -> Iterable[str]:
+        if not self.cache_listing:
+            return self._enumerate()
+        if self._cached is None:
+            self._cached = self._enumerate()
+        return self._cached
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        def _copy() -> None:
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(self.root, target, dirs_exist_ok=True)
+        await asyncio.to_thread(_copy)
+
+
+class _LayeredMaterializer:
+    """Materializer that dumps backends in reverse priority order.
+
+    Lowest-priority (last in the list) dumps first, so higher-priority
+    (earlier in the list) backends' writes overwrite on collision. This
+    preserves the first-hit read semantics of ``fs_tools_layered`` at
+    materialization time.
+    """
+
+    def __init__(self, backends: Sequence[FSBackend]) -> None:
+        self._backends = list(backends)
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        for backend in reversed(self._backends):
+            await backend.dump_to(target)
+
+    def get(self, path: str) -> str | None:
+        for backend in self._backends:
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
+
+
+def fs_tools_layered(
+    backends: Sequence[FSBackend],
+    forbidden_read: str | None = None,
+) -> tuple[list[BaseTool], Materializer]:
+    """Create stateless read-only filesystem tools over a layered backend stack.
+
+    ``backends`` are consulted in priority order (first wins) for ``get``,
+    and unioned (with de-duplication by path) for ``list``. ``forbidden_read``
+    filters the tool-visible view only; the returned materializer always
+    dumps every file so downstream consumers (e.g. solc) see a complete tree.
+
+    Returns ``(tools, materializer)``. ``tools`` is the usual
+    ``[get_file, list_files, grep_files]``; ``materializer`` dumps the
+    composite view into a caller-provided directory, honoring layer priority.
+    """
+    check_allowed = _make_checker(forbidden_read)
+    backend_list = list(backends)
+
+    def _lookup_unfiltered(path: str) -> str | None:
+        for backend in backend_list:
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
+
+    def _lookup(path: str) -> str | None:
+        if not check_allowed(path):
+            return None
+        return _lookup_unfiltered(path)
+
+    def _enumerate() -> Iterator[str]:
+        seen: set[str] = set()
+        for backend in backend_list:
+            for path in backend.list():
+                if path in seen:
+                    continue
+                seen.add(path)
+                if not check_allowed(path):
+                    continue
+                yield path
+
+    @_copy_base_doc
+    class GetFileSchema(_GetFileSchemaBase):
+        pass
+
+    @tool(args_schema=GetFileSchema)
+    @handle_path_errors
+    def get_file(path: str, range: FileRange | None = None) -> str:
+        norm_path = _normalize_and_validate(path)
+        return _get_file(_lookup(norm_path), range)
+
+    @_copy_base_doc
+    class ListFileSchema(_ListFileSchemaBase):
+        pass
+
+    @tool(args_schema=ListFileSchema)
+    def list_files() -> str:
+        return "\n".join(_enumerate())
+
+    @_copy_base_doc
+    class GrepFileSchema(_GrepFileSchemaBase):
+        pass
+
+    @tool(args_schema=GrepFileSchema)
+    def grep_files(
+        search_string: str,
+        matching_lines: bool,
+        match_in: list[str] | None = None,
+    ) -> str:
+        def file_contents() -> Iterator[tuple[str, str]]:
+            for path in _enumerate():
+                content = _lookup_unfiltered(path)
+                if content is None:
+                    continue
+                yield (path, content)
+        return _grep_impl(
+            search_string,
+            matching_lines,
+            file_contents(),
+            _lookup_unfiltered,
+            match_in,
+        )
+
+    tools: list[BaseTool] = [get_file, list_files, grep_files]
+    return tools, _LayeredMaterializer(backend_list)
+
+
 def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing: bool = True) -> list[BaseTool]:
     """
     Create stateless file system tools that operate directly on a directory.
@@ -472,69 +668,6 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing:
     Returns:
         List of tools: [get_file, list_files, grep_files]
     """
-    base_path = pathlib.Path(fs_layer)
-    check_allowed = _make_checker(forbidden_read)
-
-    def _list_all_files() -> Sequence[str]:
-        return [str(f.relative_to(base_path)) for f in base_path.rglob("*") if f.is_file()]
-
-    if cache_listing:
-        _list_all_files = cache(_list_all_files)
-
-    list_all_files = _list_all_files
-
-    @_copy_base_doc
-    class GetFileSchema(_GetFileSchemaBase):
-        pass
-
-    @tool(args_schema=GetFileSchema)
-    @handle_path_errors
-    def get_file(path: str, range: FileRange | None = None) -> str:
-        norm_path = _normalize_and_validate(path)
-        if not check_allowed(norm_path):
-            return "File not found"
-        child = base_path / norm_path
-        if child.is_file():
-            try:
-                return _get_file(child.read_text(), range)
-            except Exception:
-                return "File not found"
-        return "File not found"
-
-    @_copy_base_doc
-    class ListFileSchema(_ListFileSchemaBase):
-        pass
-
-    @tool(args_schema=ListFileSchema)
-    def list_files() -> str:
-        return "\n".join(f for f in list_all_files() if check_allowed(f))
-
-    @_copy_base_doc
-    class GrepFileSchema(_GrepFileSchemaBase):
-        pass
-
-    @tool(args_schema=GrepFileSchema)
-    def grep_files(
-        search_string: str,
-        matching_lines: bool,
-        match_in: list[str] | None = None
-    ) -> str:
-        def file_contents() -> Iterator[tuple[str, str]]:
-            for f in base_path.rglob("*"):
-                if not f.is_file():
-                    continue
-                rel_name = str(f.relative_to(base_path))
-                if not check_allowed(rel_name):
-                    continue
-                try:
-                    yield (rel_name, f.read_text())
-                except Exception:
-                    continue
-        def read_file(p: str) -> str | None:
-            try:
-                return (base_path / p).read_text()
-            except:
-                return None
-        return _grep_impl(search_string, matching_lines, file_contents(), read_file, match_in)
-
-    return [get_file, list_files, grep_files]
+    backend = DirBackend(pathlib.Path(fs_layer), cache_listing=cache_listing)
+    tools, _ = fs_tools_layered([backend], forbidden_read=forbidden_read)
+    return tools

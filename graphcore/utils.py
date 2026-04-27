@@ -123,8 +123,11 @@ def get_token_usage(m: AIMessage) -> TokenUsageDict:
         "output_tokens": 0
     }
     rm = m.response_metadata
+    if "usage" not in rm or not isinstance(rm["usage"], dict):
+        return to_ret
+    usage_meta = m.response_metadata["usage"]
     for k in _token_usage_keys:
-        tok = rm.get(k, 0)
+        tok = usage_meta.get(k, 0)
         if not isinstance(tok, int):
             continue # be cool
         to_ret[k] = to_ret[k] + tok

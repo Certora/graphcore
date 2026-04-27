@@ -12,7 +12,9 @@ from langchain_core.tools import StructuredTool, BaseTool
 
 ST = TypeVar("ST")
 
-T_RES = TypeVar("T_RES", bound=str | Command)
+type BareResult = str | dict
+
+T_RES = TypeVar("T_RES", bound=BareResult | list[BareResult] | Command)
 
 class WithInjectedState(BaseModel, Generic[ST]):
     state: Annotated[ST, InjectedState]
