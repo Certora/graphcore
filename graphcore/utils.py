@@ -114,17 +114,24 @@ class TokenUsageDict(TypedDict):
     output_tokens: int
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
+    model_name: str | None
 
 def get_token_usage(m: AIMessage) -> TokenUsageDict:
     to_ret : TokenUsageDict = {
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
         "input_tokens": 0,
-        "output_tokens": 0
+        "output_tokens": 0,
+        "model_name": None
     }
     rm = m.response_metadata
+    if "model_name" in rm and isinstance(rm['model_name'], str):
+        to_ret["model_name"] = rm['model_name']
+    if "usage" not in rm or not isinstance(rm["usage"], dict):
+        return to_ret
+    usage_meta = m.response_metadata["usage"]
     for k in _token_usage_keys:
-        tok = rm.get(k, 0)
+        tok = usage_meta.get(k, 0)
         if not isinstance(tok, int):
             continue # be cool
         to_ret[k] = to_ret[k] + tok
