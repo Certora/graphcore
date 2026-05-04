@@ -197,11 +197,40 @@ class _ListFileSchemaBase(BaseModel):
 class _PutFileSchemaBase(BaseModel):
     """
     Put file contents onto the virtual file system used by this workflow.
+
+    For incremental changes to existing files, prefer ``edit_file`` — it lets
+    you replace a substring without re-emitting the whole file. Reach for
+    ``put_file`` when creating new files, doing a wholesale rewrite, or
+    creating several files in one call.
     """
     files: dict[str, str] = \
         Field(description="A dictionary associating RELATIVE pathnames to the contents to store at those path names. Do NOT include a leading `./` it is always implied. "
               "The provided contents for the file are durably stored into the virtual filesystem. "
               "Any files contents with the same path named stored in previous tool calls are overwritten.")
+
+
+class _EditFileSchemaBase(BaseModel):
+    """
+    Replace an exact substring in an existing file on the VFS. Use this for
+    incremental changes — adding a few lines, fixing a bug, renaming an
+    identifier — instead of rewriting the file via ``put_file``.
+
+    ``old_string`` must match the file contents exactly, including whitespace
+    and newlines. If unsure, read the relevant lines via ``get_file`` first.
+
+    By default ``old_string`` must appear exactly once; the call errors on zero
+    or multiple matches so you can disambiguate by widening ``old_string`` with
+    surrounding context. Set ``replace_all=True`` to replace every occurrence.
+
+    Use ``put_file`` for files that do not yet exist or for wholesale rewrites.
+    """
+    path: str = Field(description="The relative path of the file on the VFS. Do NOT include a leading `./` (it is implied).")
+    old_string: str = Field(description="The exact substring to replace. Must match the file's contents byte-for-byte, including whitespace and newlines.")
+    new_string: str = Field(description="The replacement substring.")
+    replace_all: bool = Field(
+        description="If true, replace every occurrence of ``old_string``. If false (default), the call errors when ``old_string`` does not appear exactly once.",
+        default=False,
+    )
 
 
 class _GrepFileSchemaBase(BaseModel):
@@ -458,6 +487,54 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
             }
         )
 
+    @inject()
+    class EditFileSchema(_EditFileSchemaBase):
+        __doc__ = _EditFileSchemaBase.__doc__
+        tool_call_id: Annotated[str, InjectedToolCallId]
+
+    @tool(args_schema=EditFileSchema)
+    @handle_path_errors
+    def edit_file(
+        path: str,
+        old_string: str,
+        new_string: str,
+        state: Annotated[InputType, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        replace_all: bool = False,
+    ) -> str | Command:
+        norm_path = _normalize_and_validate(path)
+        if not can_write(norm_path):
+            return f"Illegal edit operation: cannot write {path} on the VFS"
+        cont = _get_content(state, norm_path)
+        if cont is None:
+            return (
+                f"File not found at {path}. edit_file only modifies existing files; "
+                f"use put_file to create new ones."
+            )
+        occurrences = cont.count(old_string)
+        if occurrences == 0:
+            return (
+                f"old_string does not appear in {path}. Read the file via get_file "
+                f"to verify exact contents (whitespace and newlines matter) before "
+                f"retrying."
+            )
+        if occurrences > 1 and not replace_all:
+            return (
+                f"old_string appears {occurrences} times in {path}. Either widen "
+                f"old_string with surrounding context to make it unique, or pass "
+                f"replace_all=true to replace every occurrence."
+            )
+        if replace_all:
+            new_content = cont.replace(old_string, new_string)
+        else:
+            new_content = cont.replace(old_string, new_string, 1)
+        return tool_output(
+            tool_call_id=tool_call_id,
+            res={
+                "vfs": {norm_path: new_content},
+            },
+        )
+
     def _get_content_raw(s: InputType, path: str) -> str | None:
         # Note: ``can_read`` is enforced upstream in ``_get_content`` and
         # ``_list_files``; this helper is the raw underlay reader.
@@ -559,6 +636,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     tools: list[BaseTool] = [get_file, list_files, grep_files]
     if not conf["immutable"]:
         tools.append(put_file)
+        tools.append(edit_file)
 
     materializer = _VFSAccess[InputType](conf=conf, global_include=global_include)
 
