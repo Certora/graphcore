@@ -9,7 +9,7 @@ and AI Composer (among others). It is also currently deeply undocumented.
 ### Prerequisites
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- certora-cloud CLI: `uv tool install certora-cloud`
+- certora-cloud CLI: `uv tool install "git+ssh://git@github.com/Certora/certora-cloud-cli.git"`
 - AWS credentials with access to the Certora CodeArtifact domain
 
 ### Install
