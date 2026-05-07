@@ -34,3 +34,9 @@ version-file = "graphcore/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["graphcore"]
+
+[[tool.uv.index]]
+name = "certora"
+url = "https://certora-092457480553.d.codeartifact.us-west-2.amazonaws.com/pypi/Certora-Internal/simple/"
+publish-url = "https://certora-092457480553.d.codeartifact.us-west-2.amazonaws.com/pypi/Certora-Internal/"
+explicit = true
