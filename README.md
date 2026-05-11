@@ -9,24 +9,10 @@ and AI Composer (among others). It is also currently deeply undocumented.
 ### Prerequisites
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- AWS credentials with access to the Certora CodeArtifact domain
-
-### Developer auth
-
-Bootstrap the `certora-cloud` CLI and write a CodeArtifact token to `~/.netrc`:
-
-```bash
-uv tool install 'git+ssh://git@github.com/Certora/certora-cloud-cli.git'
-certora-cloud login
-certora-cloud codeartifacts login   # writes ~/.netrc, valid ~12h
-```
-
-After that, `make login` is the everyday refresh command.
 
 ### Install
 
 ```bash
-make login   # writes ~/.netrc token, valid 12 h
 make install
 ```
 
