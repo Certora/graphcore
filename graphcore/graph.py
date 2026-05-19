@@ -13,6 +13,7 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import logging
 from typing import Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
 from typing_extensions import TypedDict
 from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
@@ -29,8 +30,21 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
-from .utils import cached_invoke, acached_invoke
+from .utils import cached_invoke, acached_invoke, current_prompt_tokens, default_max_prompt_tokens, get_token_usage
 from .summary import SummaryConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _log_usage(msg: BaseMessage) -> None:
+    """Emit a one-line per-call token-usage record. No-op if msg lacks usage metadata."""
+    if not isinstance(msg, AIMessage):
+        return
+    u = get_token_usage(msg)
+    model = u["model_name"] or "?"
+    logger.info(
+        f"LLM call ({model}): input={u['input_tokens']} output={u['output_tokens']} cache_read={u['cache_read_input_tokens']} cache_write={u['cache_creation_input_tokens']}",
+    )
 
 """
 This provides the framework for building applications which loop with an LLM,
@@ -167,13 +181,18 @@ def _async_llm(
         s: list[AnyMessage]
     ) -> BaseMessage:
         res = await acached_invoke(llm, s)
+        _log_usage(res)
         return res
     return impl
 
 def _sync_llm(
     llm: LLM
 ) -> SyncLLM:
-    return lambda m: cached_invoke(llm, m)
+    def impl(m: list[AnyMessage]) -> BaseMessage:
+        res = cached_invoke(llm, m)
+        _log_usage(res)
+        return res
+    return impl
 
 IN = TypeVar("IN")
 OUT = TypeVar("OUT")
@@ -261,7 +280,7 @@ def _get_summarizer_pure(
         summary_prompt = config.get_summarization_prompt(state)
 
         messages = state["messages"].copy()
-        assert len(messages) >= config.max_messages
+        assert messages, "summarizer invoked with empty message history"
 
         try:
             msg = yield(messages + [HumanMessage(content=summary_prompt, display_tag="summarization")])
@@ -348,7 +367,7 @@ def _get_initial_pure(
             to_ret[k] = v
         return cast(O, to_ret)
     return impl
-        
+
 
 def get_summarizer(
     llm: LLM,
@@ -496,14 +515,14 @@ class Builder(
         to_ret._summary_config = self._summary_config
         to_ret._conversation_handler = self._conversation_handler
         return to_ret
-    
+
     def with_checkpointer(self, checkpointer: Checkpointer) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret : "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_typed_to(to_ret)
         self._copy_untyped_to_(to_ret)
         to_ret._checkpointer = checkpointer
         return to_ret
-    
+
     def inject[OInput: FlowInput|None, OState: MessagesState | None, OCtxt: StateLike | None](
         self,
         f: Callable[["Builder[_BStateT, _BContextT, _BInputT]"], "Builder[OState, OCtxt, OInput]"]
@@ -572,8 +591,8 @@ class Builder(
         to_ret._summary_config = config
         return to_ret
 
-    def with_default_summarizer(self, *, max_messages: int = 20, enabled: bool = True) -> "Builder[_BStateT, _BContextT, _BInputT]":
-        return self.with_summary_config(SummaryConfig(max_messages=max_messages, enabled=enabled))
+    def with_default_summarizer(self, *, enabled: bool = True) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        return self.with_summary_config(SummaryConfig(enabled=enabled))
 
     def with_tools(self, l: Iterable[BaseTool | SplitTool]) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
@@ -638,7 +657,7 @@ class Builder(
             i=async_initial_node,
             r=async_tool_result_generator,
         )
-    
+
     def compile_async(
         self, *,
         checkpointer: Checkpointer = None
@@ -822,10 +841,14 @@ def _build_workflow(
     builder.add_edge(NO_TOOLS_NODE, TOOL_RESULT_NODE)
 
     if summary_config is not None:
+        model_name = getattr(unbound_llm, "model", "?")
+        threshold = default_max_prompt_tokens(model_name)
+        logger.info(f"Summarization threshold: {threshold} prompt tokens (model={model_name})")
+
         def routing(state: StateT) -> Literal["summarize", "tool_result", "__end__"]:
             if state.get(output_key, None) is not None:
                 return "__end__"
-            elif len(state["messages"]) > summary_config.max_messages:
+            elif current_prompt_tokens(state["messages"]) > threshold:
                 return "summarize"
             else:
                 return "tool_result"
