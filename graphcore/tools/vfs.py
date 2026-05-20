@@ -48,10 +48,18 @@ def _make_checker(patt: str | None) -> Callable[[str], bool]:
     match = re.compile(patt)
     return lambda f_name: match.fullmatch(f_name) is None
 
-def _get_file(cont: str | None) -> str:
+class FileRange(BaseModel):
+    start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
+    end_line: int = Field(description="The line to read until EXCLUSIVE.")
+
+def _get_file(cont: str | None, range: FileRange | None) -> str:
     if cont is None:
         return "File not found"
-    return cont
+    if not range:
+        return cont
+    start = range.start_line - 1
+    to_ret = cont.splitlines()[start:range.end_line - 1]
+    return "\n".join(to_ret)
 
 
 
@@ -117,6 +125,7 @@ class _GetFileSchemaBase(BaseModel):
     If the path doesn't exist, this function returns "File not found".
     """
     path: str = Field(description="The relative path of the file on the VFS. IMPORTANT: Do NOT include a leading `./` it is implied")
+    range: FileRange | None = Field(description="If set, (start, end) indicates to return lines starting from line `start` (lines are 1 indexed) until `end` (exclusive). If unset, the entire file is returned.", default=None)
 
 
 class _ListFileSchemaBase(BaseModel):
@@ -378,10 +387,11 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
     def get_file(
         path: str,
         state: Annotated[InputType, InjectedState],
+        range: FileRange | None = None
     ) -> str:
         norm_path = _normalize_and_validate(path)
         cont = _get_content(state, norm_path)
-        return _get_file(cont)
+        return _get_file(cont, range)
 
     @cache
     def list_underlying() -> Sequence[str]:
@@ -479,14 +489,14 @@ def fs_tools(fs_layer: str, forbidden_read: str | None = None, *, cache_listing:
 
     @tool(args_schema=GetFileSchema)
     @handle_path_errors
-    def get_file(path: str) -> str:
+    def get_file(path: str, range: FileRange | None = None) -> str:
         norm_path = _normalize_and_validate(path)
         if not check_allowed(norm_path):
             return "File not found"
         child = base_path / norm_path
         if child.is_file():
             try:
-                return _get_file(child.read_text())
+                return _get_file(child.read_text(), range)
             except Exception:
                 return "File not found"
         return "File not found"
