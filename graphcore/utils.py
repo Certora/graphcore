@@ -136,3 +136,40 @@ def get_token_usage(m: AIMessage) -> TokenUsageDict:
             continue # be cool
         to_ret[k] = to_ret[k] + tok
     return to_ret
+
+
+def current_prompt_tokens(messages: List[AnyMessage]) -> int:
+    """
+    Effective context size of the most recent LLM call, used to decide when to summarize.
+
+    Returns input + cache-read + cache-creation tokens from the latest AIMessage. ToolMessages
+    appended after that AIMessage are not counted (router fires after TOOLS_NODE) and the
+    summarizer's own AIMessage is discarded before reaching state. Both are small enough that
+    the threshold should be set with headroom anyway.
+    """
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            usage = get_token_usage(m)
+            return (
+                usage["input_tokens"]
+                + usage["cache_read_input_tokens"]
+                + usage["cache_creation_input_tokens"]
+            )
+    return 0
+
+
+def default_max_prompt_tokens(model_name: str) -> int:
+    """
+    Prompt-token threshold at which to compact history. Keep this conservatively below the model's
+    context window to leave room for output, thinking budget, and the next batch of tool results.
+    Add a new case here when introducing a new model.
+    """
+    match model_name:
+        case "claude-opus-4-6":
+            return 500_000   # 1M context window
+        case "claude-sonnet-4-6":
+            return 500_000   # 1M context window
+        case "claude-opus-4-7":
+            return 500_000   # 1M context window
+        case _:
+            return 100_000   # fallback for unknown models
