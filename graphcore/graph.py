@@ -29,7 +29,6 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
-from .utils import cached_invoke, acached_invoke
 from .summary import SummaryConfig
 
 """
@@ -166,14 +165,13 @@ def _async_llm(
     async def impl(
         s: list[AnyMessage]
     ) -> BaseMessage:
-        res = await acached_invoke(llm, s)
-        return res
+        return await llm.ainvoke(s)
     return impl
 
 def _sync_llm(
     llm: LLM
 ) -> SyncLLM:
-    return lambda m: cached_invoke(llm, m)
+    return lambda m: llm.invoke(m)
 
 IN = TypeVar("IN")
 OUT = TypeVar("OUT")
