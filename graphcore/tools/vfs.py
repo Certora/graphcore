@@ -125,7 +125,16 @@ class _GetFileSchemaBase(BaseModel):
     If the path doesn't exist, this function returns "File not found".
     """
     path: str = Field(description="The relative path of the file on the VFS. IMPORTANT: Do NOT include a leading `./` it is implied")
-    range: FileRange | None = Field(description="If set, (start, end) indicates to return lines starting from line `start` (lines are 1 indexed) until `end` (exclusive). If unset, the entire file is returned.", default=None)
+    range: FileRange | None = Field(
+        description=(
+            "Optional line range. By DEFAULT leave this unset to read the entire file — partial reads "
+            "routinely miss surrounding context (imports, related definitions, modifiers) and force "
+            "wasteful re-reads. Only set this for exceptionally large files where you are certain no "
+            "other part will be relevant. When set, (start, end) returns lines from `start` (1-indexed) "
+            "until `end` (exclusive)."
+        ),
+        default=None,
+    )
 
 
 class _ListFileSchemaBase(BaseModel):
