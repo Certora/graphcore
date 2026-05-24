@@ -158,7 +158,7 @@ def current_prompt_tokens(messages: List[AnyMessage]) -> int:
     return 0
 
 
-def default_max_prompt_tokens(model_name: str) -> int:
+def default_max_prompt_tokens(model_name: str | None) -> int:
     """
     Prompt-token threshold at which to compact history. Keep this conservatively below the model's
     context window to leave room for output, thinking budget, and the next batch of tool results.

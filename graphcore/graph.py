@@ -841,7 +841,7 @@ def _build_workflow(
     builder.add_edge(NO_TOOLS_NODE, TOOL_RESULT_NODE)
 
     if summary_config is not None:
-        model_name = getattr(unbound_llm, "model", "")
+        model_name = getattr(unbound_llm, "model", None)
         threshold = default_max_prompt_tokens(model_name)
         logger.info(f"Summarization threshold: {threshold} prompt tokens (model={model_name})")
 
