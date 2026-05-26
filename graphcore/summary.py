@@ -22,8 +22,7 @@ StateT = TypeVar("StateT", contravariant=True)
 logger = logging.getLogger(__name__)
 
 class SummaryConfig(Generic[StateT]):
-    def __init__(self, max_messages: int = 20, enabled: bool = True):
-        self.max_messages = max_messages
+    def __init__(self, enabled: bool = True):
         self.enabled = enabled
 
     def get_summarization_prompt(self, state: StateT) -> str:
