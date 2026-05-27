@@ -13,92 +13,9 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import List, cast, TypedDict, Literal
-from langchain_core.messages import BaseMessage, AnyMessage, HumanMessage, ToolMessage, AIMessage
-from langchain_core.language_models.base import LanguageModelInput
-from langchain_core.runnables import Runnable
+from typing import TypedDict, Literal, List
+from langchain_core.messages import AIMessage, AnyMessage
 
-
-def canonicalize_message(s: AnyMessage) -> AnyMessage:
-    """
-    Canonicalize the `content` of `s` if it is a `HumanMessage` or `ToolMessage`, otherwise
-    leave it unchanged. The canonical representation of `content` for human and tool messages
-    is a list of dicts of the form `{ "type": "text", "text": t }` where `t` is the textual content
-    of the message. Note that the type of `content` also allows a regular old string or a
-    list of strings, which this function transforms into the dict representation described above.
-
-    NB: this function is *pure*; the original object `s` is *unchanged* by this function.
-    """
-    match s:
-        case HumanMessage(content=cont) | ToolMessage(content=cont):
-            cont_list: List[str | dict] = cont if isinstance(cont, list) else [cont]
-            new_cont: List[str | dict] = [
-                d if isinstance(d, dict) else {
-                    "type": "text",
-                    "text": d
-                } for d in cont_list
-            ]
-            s_copy = s.model_copy()
-            s_copy.content = new_cont
-            return s_copy
-        case _:
-            return s
-
-
-def canonicalize(s: List[AnyMessage]) -> List[AnyMessage]:
-    """
-    Canonicalize all messages in `s` via `canonicalize_message`.
-    `s` is unchanged by this function, the list returned is a fresh list,
-    and any canonicalization is performed on copies of the original messages in `s`.
-    """
-    return [canonicalize_message(m) for m in s]
-
-
-def add_cache_control(s: List[AnyMessage]) -> List[AnyMessage]:
-    """
-    Add a `cache_control` directive to the last human/tool message in
-    the canonical representation of `s` (as determined by `canonicalize`).
-    This function returns a copy of `s` with the canonicalization & cache control
-    directives applied.
-    """
-    canon = canonicalize(s)
-    for i in range(len(canon) - 1, -1, -1):
-        curr = canon[i]
-        match curr:
-            case HumanMessage(content=cont) | ToolMessage(content=cont):
-                cont_list = cast(List[dict], cont)
-                if not cont_list:
-                    continue
-                new_cont_list = cont_list.copy()
-                final_elem = new_cont_list[-1]
-                new_cont_list[-1] = {
-                    **final_elem,
-                    "cache_control": {"type": "ephemeral"}
-                }
-                mutated = curr.model_copy()
-                mutated.content = cast(List[str | dict], new_cont_list)
-                to_ret = canon.copy()
-                to_ret[i] = mutated
-                return to_ret
-            case _:
-                continue
-    return s
-
-def cached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[AnyMessage]) -> BaseMessage:
-    """
-    Send messages `s` to the llm `b` after adding caching instructions.
-    """
-    canon = add_cache_control(s)
-    to_ret = b.invoke(canon)
-    return to_ret
-
-async def acached_invoke(b: Runnable[LanguageModelInput, BaseMessage], s: List[AnyMessage]) -> BaseMessage:
-    """
-    Send messages `s` to the llm `b` after adding caching instructions.
-    """
-    canon = add_cache_control(s)
-    to_ret = await b.ainvoke(canon)
-    return to_ret
 
 type TokenUsageKeysT = Literal[
     "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
@@ -136,3 +53,40 @@ def get_token_usage(m: AIMessage) -> TokenUsageDict:
             continue # be cool
         to_ret[k] = to_ret[k] + tok
     return to_ret
+
+
+def current_prompt_tokens(messages: List[AnyMessage]) -> int:
+    """
+    Effective context size of the most recent LLM call, used to decide when to summarize.
+
+    Returns input + cache-read + cache-creation tokens from the latest AIMessage. ToolMessages
+    appended after that AIMessage are not counted (router fires after TOOLS_NODE) and the
+    summarizer's own AIMessage is discarded before reaching state. Both are small enough that
+    the threshold should be set with headroom anyway.
+    """
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            usage = get_token_usage(m)
+            return (
+                usage["input_tokens"]
+                + usage["cache_read_input_tokens"]
+                + usage["cache_creation_input_tokens"]
+            )
+    return 0
+
+
+def default_max_prompt_tokens(model_name: str | None) -> int:
+    """
+    Prompt-token threshold at which to compact history. Keep this conservatively below the model's
+    context window to leave room for output, thinking budget, and the next batch of tool results.
+    Add a new case here when introducing a new model.
+    """
+    match model_name:
+        case "claude-opus-4-6":
+            return 500_000   # 1M context window
+        case "claude-sonnet-4-6":
+            return 500_000   # 1M context window
+        case "claude-opus-4-7":
+            return 500_000   # 1M context window
+        case _:
+            return 100_000   # fallback for unknown models
