@@ -13,8 +13,11 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import TypedDict, Literal, List
-from langchain_core.messages import AIMessage, AnyMessage
+from typing import TypedDict, Literal, List, Sequence
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage
+from langchain_core.runnables import Runnable
 
 
 type TokenUsageKeysT = Literal[
@@ -54,6 +57,47 @@ def get_token_usage(m: AIMessage) -> TokenUsageDict:
         to_ret[k] = to_ret[k] + tok
     return to_ret
 
+class NormalizedTokenUsage(TypedDict):
+    total_input_tokens: int
+    total_output_tokens: int
+
+    cache_read_tokens: int
+    cache_write_tokens: int
+    thinking_tokens: int
+
+    model_name: str | None
+
+def get_normalized_token_usage(m: AIMessage) -> NormalizedTokenUsage:
+    to_ret : NormalizedTokenUsage = {
+        "total_input_tokens": 0,
+        "model_name": m.response_metadata.get("model_name"),
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "thinking_tokens": 0,
+        "total_output_tokens": 0
+    }
+
+    if not (usage := m.usage_metadata):
+        return to_ret
+    
+    to_ret["total_input_tokens"] = usage["input_tokens"]
+    to_ret["total_output_tokens"] = usage["output_tokens"]
+
+    if "output_token_details" in usage:
+        out_details = usage["output_token_details"]
+        to_ret["thinking_tokens"] = out_details.get("reasoning", 0)
+    if "input_token_details" in usage:
+        in_details = usage["input_token_details"]
+        to_ret["cache_read_tokens"] = in_details.get("cache_read", 0)
+        
+        cache_write = in_details.get("cache_creation", 0)
+        if not cache_write:
+            # thanks langchain
+            for t in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+                cache_write += in_details.get(t, 0)
+        to_ret["cache_write_tokens"] = cache_write
+    
+    return to_ret
 
 def current_prompt_tokens(messages: List[AnyMessage]) -> int:
     """
@@ -66,12 +110,8 @@ def current_prompt_tokens(messages: List[AnyMessage]) -> int:
     """
     for m in reversed(messages):
         if isinstance(m, AIMessage):
-            usage = get_token_usage(m)
-            return (
-                usage["input_tokens"]
-                + usage["cache_read_input_tokens"]
-                + usage["cache_creation_input_tokens"]
-            )
+            usage = get_normalized_token_usage(m)
+            return usage["total_input_tokens"]
     return 0
 
 
@@ -90,3 +130,70 @@ def default_max_prompt_tokens(model_name: str | None) -> int:
             return 500_000   # 1M context window
         case _:
             return 100_000   # fallback for unknown models
+
+
+# ---------------------------------------------------------------------------
+# Content normalization for LLM invocation
+#
+# OpenAI's Chat Completions API rejects bare strings inside a list-shaped
+# ``content`` — every list element must be a content-part dict with a
+# ``type`` key. Anthropic's Messages API is more permissive and tolerates
+# ``list[str | dict]``, but it also accepts the strict ``list[dict]``
+# form, so we normalize everything to ``list[dict]`` unconditionally
+# before invoking. ``invoke`` / ``ainvoke`` are the wrappers every
+# workflow LLM call should go through.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_content(content: str | list[str | dict]) -> str | list[dict]:
+    """Promote bare strings inside a list-content to ``{"type": "text",
+    "text": s}`` dicts. ``str`` content (the single-text form) is
+    passed through unchanged."""
+    if not isinstance(content, list):
+        return content
+    out: list[dict] = []
+    for item in content:
+        if isinstance(item, str):
+            out.append({"type": "text", "text": item})
+        else:
+            out.append(item)
+    return out
+
+
+def _normalize_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
+    """Return a list of messages whose ``content`` (where list-shaped)
+    has every bare string promoted to a text content-part dict. Each
+    affected message is copied; messages that already conform are
+    passed through unchanged so we don't churn references that the
+    caller may still hold."""
+    out: list[BaseMessage] = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, list):
+            normalized = _normalize_content(content)
+            if normalized is not content:
+                m = m.model_copy(update={"content": normalized})
+        out.append(m)
+    return out
+
+
+def invoke(
+    llm: BaseChatModel | Runnable,
+    messages: Sequence[BaseMessage],
+    **kwargs,
+) -> BaseMessage:
+    """Synchronous LLM invocation wrapper that normalizes message
+    content shapes before calling ``llm.invoke``. Use this in place of
+    ``llm.invoke(messages)`` everywhere a workflow talks to the model
+    — the normalization keeps OpenAI's Chat Completions happy and
+    leaves Anthropic's Messages API behavior unchanged."""
+    return llm.invoke(_normalize_messages(messages), **kwargs)
+
+
+async def ainvoke(
+    llm: BaseChatModel | Runnable,
+    messages: Sequence[BaseMessage],
+    **kwargs,
+) -> BaseMessage:
+    """Async counterpart to :func:`invoke`."""
+    return await llm.ainvoke(_normalize_messages(messages), **kwargs)
