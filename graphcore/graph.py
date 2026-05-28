@@ -46,6 +46,33 @@ def _log_usage(msg: BaseMessage) -> None:
         f"LLM call ({model}): input={u['input_tokens']} output={u['output_tokens']} cache_read={u['cache_read_input_tokens']} cache_write={u['cache_creation_input_tokens']}",
     )
 
+
+class MaxTokensExceededError(RuntimeError):
+    """LLM response was truncated by hitting its max_tokens cap.
+
+    Continuing would feed a partial response (truncated tool-call args, half-finished
+    JSON, etc.) back into the loop. The LLM typically repeats the same truncation on
+    retry, so the workflow wedges. Raise --tokens (or the model's max_tokens setting)
+    and re-run.
+    """
+
+
+def _check_max_tokens(msg: BaseMessage) -> None:
+    if not isinstance(msg, AIMessage):
+        return
+    rm = msg.response_metadata or {}
+    if rm.get("stop_reason") != "max_tokens":
+        return
+    u = get_token_usage(msg)
+    raise MaxTokensExceededError(
+        f"LLM output hit max_tokens cap "
+        f"(model={u['model_name'] or '?'}, "
+        f"output_tokens={u['output_tokens']}, input_tokens={u['input_tokens']}). "
+        "Response was truncated mid-generation; continuing would feed a partial "
+        "result back to the model and almost certainly loop. Raise --tokens (or the "
+        "model's max_tokens setting) and re-run."
+    )
+
 """
 This provides the framework for building applications which loop with an LLM,
 using tools to refine the LLM output.
@@ -182,6 +209,7 @@ def _async_llm(
     ) -> BaseMessage:
         res = await llm.ainvoke(s)
         _log_usage(res)
+        _check_max_tokens(res)
         return res
     return impl
 
@@ -191,6 +219,7 @@ def _sync_llm(
     def impl(m: list[AnyMessage]) -> BaseMessage:
         res = llm.invoke(m)
         _log_usage(res)
+        _check_max_tokens(res)
         return res
     return impl
 
