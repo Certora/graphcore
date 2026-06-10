@@ -1369,10 +1369,12 @@ class _OpenAIMemorySchema(BaseModel):
         ),
     )
 
+type ErrHandler[R] = Callable[[str], R]
 
 def _dispatch_openai_op[R](
     backend: MemoryToolImpl[R],
-    op: _CreateOp | _ViewOp | _StrReplaceOp | _InsertOp | _DeleteOp | _RenameOp,
+    op: _MemoryOpUnion,
+    err_handler: ErrHandler
 ) -> R:
     """Route a parsed sum-type variant into the backend's typed methods."""
     match op:
@@ -1380,8 +1382,10 @@ def _dispatch_openai_op[R](
             return backend.create(p, ft)
         case _ViewOp(path=p, view_range=vr):
             rng: tuple[int, int] | None = None
-            if vr is not None and len(vr) >= 2:
+            if vr is not None and len(vr) == 2:
                 rng = (vr[0], vr[1])
+            elif vr is not None:
+                return err_handler(f"Error: view range invalid, expected an array of exactly 2 elements, received {len(vr)}")
             return backend.view(p, rng)
         case _StrReplaceOp(path=p, old_str=os_, new_str=ns):
             return backend.str_replace(p, os_, ns)
@@ -1419,6 +1423,9 @@ Prefer ``view`` before ``create`` to avoid clobbering, and prefer
 def openai_async_memory_tool(
     backend: MemoryToolImpl[Awaitable[str]],
 ) -> BaseTool:
+    async def err_handler(s: str) -> str:
+        return s
+
     """Async OpenAI-flavored memory tool. Same backend contract as
     :func:`async_memory_tool`; differs only in the tool-args schema
     seen by the model."""
@@ -1428,7 +1435,7 @@ def openai_async_memory_tool(
 
         @override
         async def run(self) -> str:
-            return await _dispatch_openai_op(backend, self.memory_op)
+            return await _dispatch_openai_op(backend, self.memory_op, err_handler)
     return OpenAIMemoryTool.as_tool("memory")
 
 
@@ -1441,5 +1448,5 @@ def openai_memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
 
         @override
         def run(self) -> str:
-            return _dispatch_openai_op(backend, self.memory_op)
+            return _dispatch_openai_op(backend, self.memory_op, lambda s: s)
     return OpenAIMemoryTool.as_tool("memory")
