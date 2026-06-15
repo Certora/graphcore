@@ -46,6 +46,25 @@ def _log_usage(msg: BaseMessage) -> None:
         f"LLM call ({model}): input={u['input_tokens']} output={u['output_tokens']} cache_read={u['cache_read_input_tokens']} cache_write={u['cache_creation_input_tokens']}",
     )
 
+
+def _apply_cache_ttl(llm: BaseChatModel, ttl: str | None) -> BaseChatModel:
+    """Override the prompt-cache TTL on an Anthropic model's auto-cache breakpoint.
+
+    The caller configures ``cache_control`` via ``model_kwargs`` (e.g. ``{"type":
+    "ephemeral"}``, the Anthropic 5-minute default); this rewrites that block's ``ttl`` so
+    this graph's calls cache for ``ttl`` (e.g. ``"1h"``) instead. It overrides the existing
+    breakpoint rather than adding one. No-op when ``ttl`` is None or the model isn't a
+    ChatAnthropic.
+    """
+    if ttl is None or not isinstance(llm, ChatAnthropic):
+        return llm
+    model_kwargs = {**(llm.model_kwargs or {})}
+    model_kwargs["cache_control"] = {
+        **model_kwargs.get("cache_control", {"type": "ephemeral"}),
+        "ttl": ttl,
+    }
+    return llm.model_copy(update={"model_kwargs": model_kwargs})
+
 """
 This provides the framework for building applications which loop with an LLM,
 using tools to refine the LLM output.
@@ -472,6 +491,7 @@ class Builder(
 
         self._summary_config : SummaryConfig[_BStateT] | None = None
         self._unbound_llm : BaseChatModel | None = None
+        self._cache_ttl : str | None = None
 
         self._state_class: type[_BStateT] | None = None
         self._input_type : type[_BInputT] | None = None
@@ -486,6 +506,7 @@ class Builder(
         other._initial_prompt = self._initial_prompt
         other._sys_prompt = self._sys_prompt
         other._unbound_llm = self._unbound_llm
+        other._cache_ttl = self._cache_ttl
         other._output_key = self._output_key
         other._tools.extend(self._tools)
         other._loader = self._loader
@@ -577,6 +598,19 @@ class Builder(
         to_ret._unbound_llm = llm
         return to_ret
 
+    def with_cache_ttl(self, ttl: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        """Prompt-cache TTL for this graph's LLM calls (e.g. ``"1h"``).
+
+        Unset (the default) leaves the model's configured default in place — for Anthropic,
+        the 5-minute ephemeral cache. Use a longer TTL for loops that block on slow tools
+        (e.g. the prover) between calls, so the cached prefix survives the wait.
+        """
+        to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+        to_ret._cache_ttl = ttl
+        return to_ret
+
     def with_output_key(self, key: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_untyped_to_(to_ret)
@@ -634,7 +668,7 @@ class Builder(
             sys_prompt=self._sys_prompt,
             initial_prompt=self._initial_prompt,
             output_key=self._output_key,
-            unbound_llm=self._unbound_llm,
+            unbound_llm=_apply_cache_ttl(self._unbound_llm, self._cache_ttl),
             context_schema=self._context_type,
             summary_config=self._summary_config, #type: ignore
             init_fact=i,
