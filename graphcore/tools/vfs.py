@@ -35,9 +35,9 @@ from ..graph import FlowInput
 from ..graph import tool_output
 
 
-def _copy_base_doc[T](cls: T) -> T:
+def _copy_base_doc[T: type](cls: T) -> T:
     """Decorator to copy __doc__ from the first base class."""
-    for base in cls.__bases__:  # type: ignore
+    for base in cls.__bases__:
         if base.__doc__:
             cls.__doc__ = base.__doc__
             break
@@ -59,11 +59,10 @@ def _make_checker(patt: str | None) -> Callable[[str], bool]:
 # predicates union on top of this floor.
 
 
-def _floor_include(path: str) -> bool:
+def _floor_exclude(path: str) -> bool:
     """``.git`` directory and contents are always excluded. True if the
-    path passes the floor (i.e. is NOT under .git anywhere in its path
-    parts; covers root .git, nested .git from submodules, etc.)."""
-    return ".git" not in pathlib.PurePosixPath(path).parts
+    path includes git, matching polarity of user facing predicates (exclusion)"""
+    return ".git" in pathlib.PurePosixPath(path).parts
 
 
 # Type alias for the user-facing ``global_exclude`` config. Both forms
@@ -88,14 +87,14 @@ def _make_global_include_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
     composition stays consistent.
     """
     if arg is None:
-        return _floor_include
+        return lambda s: not _floor_exclude(s)
     if isinstance(arg, str):
         rx = re.compile(arg)
         # fullmatch for symmetry with forbidden_read/forbidden_write.
-        return lambda p: _floor_include(p) and rx.fullmatch(p) is None
+        return lambda p: not _floor_exclude(p) and rx.fullmatch(p) is None
     # Callable form: caller's predicate returns True to exclude. We flip.
     user_excludes = arg
-    return lambda p: _floor_include(p) and not user_excludes(pathlib.PurePosixPath(p))
+    return lambda p: not _floor_exclude(p) and not user_excludes(pathlib.PurePosixPath(p))
 
 class FileRange(BaseModel):
     start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
@@ -524,10 +523,7 @@ def vfs_tools(conf: VFSToolConfig, ty: Type[InputType]) -> tuple[list[BaseTool],
                 f"old_string with surrounding context to make it unique, or pass "
                 f"replace_all=true to replace every occurrence."
             )
-        if replace_all:
-            new_content = cont.replace(old_string, new_string)
-        else:
-            new_content = cont.replace(old_string, new_string, 1)
+        new_content = cont.replace(old_string, new_string)
         return tool_output(
             tool_call_id=tool_call_id,
             res={
