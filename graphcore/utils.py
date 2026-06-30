@@ -154,6 +154,8 @@ def _normalize_content(content: str | list[str | dict]) -> str | list[dict]:
     out: list[dict] = []
     for item in content:
         if isinstance(item, str):
+            if len(item) == 0: # some providers crash on empty text blocks, even in the context of non-empty messages
+                continue
             out.append({"type": "text", "text": item})
         else:
             out.append(item)
@@ -171,8 +173,7 @@ def _normalize_messages(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
         content = m.content
         if isinstance(content, list):
             normalized = _normalize_content(content)
-            if normalized is not content:
-                m = m.model_copy(update={"content": normalized})
+            m = m.model_copy(update={"content": normalized})
         out.append(m)
     return out
 
