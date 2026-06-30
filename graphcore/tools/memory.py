@@ -1267,7 +1267,7 @@ def _memory_tool_impl[R](
                 range = (args.view_range[0], args.view_range[1])
             return backend.view(args.path, range)
 
-def async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
+def _async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
     async def missing_required(s: str):
         return f"Error: missing required {s} argument"
     
@@ -1285,7 +1285,7 @@ def async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
                 return f"Error: {e.msg}"
     return MemoryTool.as_tool("memory")
 
-def memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
+def _memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
     """
     Generates a memory tool using the given backend.
     """
@@ -1306,6 +1306,8 @@ def memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
                 return f"Error: {e.msg}"
     return MemoryTool.as_tool("memory")
 
+anthropic_async_memory_tool = _async_memory_tool
+anthropic_memory_tool = _memory_tool
 
 # ---------------------------------------------------------------------------
 # OpenAI-targeted memory tool: discriminated-union schema.
