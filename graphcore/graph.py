@@ -30,7 +30,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
-from .utils import current_prompt_tokens, default_max_prompt_tokens, get_token_usage
+from .utils import ainvoke, invoke, current_prompt_tokens, default_max_prompt_tokens, get_token_usage
 from .summary import SummaryConfig
 
 logger = logging.getLogger(__name__)
@@ -180,7 +180,7 @@ def _async_llm(
     async def impl(
         s: list[AnyMessage]
     ) -> BaseMessage:
-        res = await llm.ainvoke(s)
+        res = await ainvoke(llm, s)
         _log_usage(res)
         return res
     return impl
@@ -189,7 +189,7 @@ def _sync_llm(
     llm: LLM
 ) -> SyncLLM:
     def impl(m: list[AnyMessage]) -> BaseMessage:
-        res = llm.invoke(m)
+        res = invoke(llm, m)
         _log_usage(res)
         return res
     return impl

@@ -18,7 +18,7 @@ from langgraph.prebuilt import ToolNode
 from graphcore.tools.memory import (
     MemoryBackendError,
     MemoryToolImpl,
-    async_memory_tool,
+    anthropic_async_memory_tool as async_memory_tool,
 )
 
 from .conftest import AnyAsyncBackend, AsyncBackendFactory

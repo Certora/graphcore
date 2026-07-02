@@ -13,8 +13,92 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# =============================================================================
+# Memory tool architecture
+# =============================================================================
+#
+# Three layers, each one a translation of the one above:
+#
+#   PURE LOGIC  ──>  BACKEND  ──>  TOOL
+#  (effects as     (drives the      (langchain BaseTool,
+#   generators)     generators       provider-specific
+#                   against I/O)     schema)
+#
+# ── Pure layer (`PureMemoryBackend[P, Update, Row, RList]`) ────────────────
+#   The semantic operations (view / create / str_replace / insert / rename /
+#   delete, plus their _pure helpers) are written as generators that *yield*
+#   I/O requests of type `P` and *receive* I/O results (`Row` for one-row
+#   reads, `RList` for multi-row reads, `Update` for write row-counts).
+#   These generators do no I/O themselves — they describe the sequence of
+#   primitive operations they need, and each primitive op is itself a
+#   generator method (`read_file_pure`, `write_file_pure`, `stat_pure`,
+#   `list_dir_pure`, `rm_pure`, `do_rename_pure`) that subclasses define in
+#   terms of `P`.
+#
+#   Why this shape? **It solves the function-coloring problem.** Python's
+#   `async` is infectious — if the core "view a file with a line range"
+#   logic awaited an I/O call, every caller up the stack would have to be
+#   async too, and you couldn't share that body between a sync driver
+#   (e.g. a synchronous Postgres connection) and an async driver (e.g. an
+#   async pool). By representing I/O as yielded requests instead of awaited
+#   calls, the core generator is *colorless*: a sync driver advances it
+#   with `next()` / `.send(result)`, an async driver does the same with
+#   `await some_io(...)` between the steps. Same logic, two drivers.
+#
+#   That's also how `SQLBackendPure` (`P = (sql, params)`, yields SQL,
+#   consumes rows) ends up shared by both `SyncSqlBackend` and
+#   `AsyncSQLBackend`. `PureFilesystemLogic` uses `P = Never` via
+#   `to_generator` since its primitives don't need a wedge — but the same
+#   `_view_file_pure` / `create_pure` / etc. logic is reused by both
+#   `FileSystemMemoryBackend` and `AsyncFileMemoryBackend`.
+#
+# ── Backend layer (`MemoryBackend` / `AsyncMemoryBackend`) ─────────────────
+#   These are the drivers. They hold a `PureMemoryBackend` (`self.logic`)
+#   and implement `_run_row` / `_run_multi` / `_run_update`: feed the
+#   generator, get a request `P`, perform the I/O, send the result back into
+#   the generator, repeat until `StopIteration`.
+#
+#   Concrete impls:
+#     • `PostgresMemoryBackend`, `SqliteMemoryBackend` — sync SQL drivers
+#       holding a real connection/pool and a `SQLBackendPure` logic.
+#     • `AsyncPostgresBackend` — async variant of the same.
+#     • `FileSystemMemoryBackend` / `AsyncFileMemoryBackend` — drivers over
+#       `PureFilesystemLogic` whose `_run_*` methods just exhaust the
+#       generator (no I/O wedge needed; primitives already did the work).
+#
+#   The public surface of a Backend is the six `MemoryToolImpl` methods
+#   (view, create, delete, rename, insert, str_replace). Sync impls return
+#   `str`; async impls return `Awaitable[str]`. This is what the tool layer
+#   consumes.
+#
+# ── Tool layer (`*_memory_tool` factories) ────────────────────────────────
+#   `MemoryToolImpl[R]` is a structural Protocol — both `MemoryBackend` and
+#   `AsyncMemoryBackend` satisfy it, parameterized on `R = str` vs
+#   `R = Awaitable[str]`. The tool factories close over a `MemoryToolImpl`
+#   and wrap it in a `BaseTool` with a provider-specific args schema:
+#
+#     • `memory_tool`            — sync,  Anthropic schema (UnifiedMemorySchema)
+#     • `async_memory_tool`      — async, Anthropic schema
+#     • `openai_memory_tool`     — sync,  OpenAI schema (_OpenAIMemorySchema)
+#     • `openai_async_memory_tool` — async, OpenAI schema
+#
+#   Anthropic's `UnifiedMemorySchema` is a flat bag of nullable fields,
+#   shape-matched to what Anthropic's trained-on memory tool emits. The
+#   Anthropic Files-API beta (`memory_20250818`) replaces this schema
+#   server-side, so the "sparse" tool and field documentations don't matter.
+#
+#   OpenAI's `_OpenAIMemorySchema` wraps a single `memory_op` field whose
+#   type is a Pydantic discriminated union over six variant BaseModels
+#   (one per command). Top level is `type: "object"` so strict-mode JSON
+#   schema validation works; the `anyOf` lives inside `memory_op`.
+#
+#   Dispatch: `_memory_tool_impl` handles the flat-bag → backend-method
+#   path; `_dispatch_openai_op` handles the sum-type → backend-method path.
+#   Both end up calling the same six MemoryToolImpl methods.
+# =============================================================================
+
 from typing import (
-    Literal, Optional, override, Protocol, Any, TypeVar, Iterator, 
+    Annotated, Literal, Optional, override, Protocol, Any, TypeVar, Iterator,
     ContextManager, LiteralString, cast, Generator,
     AsyncContextManager, AsyncIterator, Callable, Awaitable, Sequence,
     Never, ParamSpec
@@ -1183,7 +1267,7 @@ def _memory_tool_impl[R](
                 range = (args.view_range[0], args.view_range[1])
             return backend.view(args.path, range)
 
-def async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
+def _async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
     async def missing_required(s: str):
         return f"Error: missing required {s} argument"
     
@@ -1201,13 +1285,13 @@ def async_memory_tool(backend: MemoryToolImpl[Awaitable[str]]) -> BaseTool:
                 return f"Error: {e.msg}"
     return MemoryTool.as_tool("memory")
 
-def memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
+def _memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
     """
     Generates a memory tool using the given backend.
     """
     def missing_required(s: str):
         return f"Error: missing required {s} argument"
-    
+
     class MemoryTool(WithImplementation[str], UnifiedMemorySchema):
         """
         Here to make the tool annotation happy
@@ -1221,3 +1305,167 @@ def memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
             except InvalidPathError as e:
                 return f"Error: {e.msg}"
     return MemoryTool.as_tool("memory")
+
+anthropic_async_memory_tool = _async_memory_tool
+anthropic_memory_tool = _memory_tool
+
+# ---------------------------------------------------------------------------
+# OpenAI-targeted memory tool: discriminated-union schema.
+#
+# OpenAI (and OpenAI-compat backends) doesn't have a trained-on memory tool
+# schema the way Anthropic does, so we can pick the shape. A sum type with a
+# single ``memory_op`` field is much friendlier to the model — each variant
+# only carries the fields its command actually needs — and stays
+# strict-mode-compatible because the top level is still ``type: "object"``.
+# ---------------------------------------------------------------------------
+
+
+class _CreateOp(BaseModel):
+    """Create a file at ``path`` with the given contents."""
+    op: Literal["create"]
+    path: str = Field(description="Absolute memory path (must start with /memories).")
+    file_text: str = Field(description="Full contents of the new file.")
+
+
+class _ViewOp(BaseModel):
+    """Read a file or list a directory under ``path``."""
+    op: Literal["view"]
+    path: str = Field(description="Absolute memory path (must start with /memories).")
+    view_range: list[int] | None = Field(
+        default=None,
+        description=(
+            "Optional [start, end] line range (1-indexed, inclusive). "
+            "Use -1 for end to read to EOF. Ignored for directories."
+        ),
+    )
+
+
+class _StrReplaceOp(BaseModel):
+    """Replace a unique substring in the file at ``path``."""
+    op: Literal["str_replace"]
+    path: str = Field(description="Absolute memory path (must start with /memories).")
+    old_str: str = Field(description="Exact substring to replace. Must occur exactly once.")
+    new_str: str = Field(description="Replacement text.")
+
+
+class _InsertOp(BaseModel):
+    """Insert a new line at ``insert_line`` in the file at ``path``."""
+    op: Literal["insert"]
+    path: str = Field(description="Absolute memory path (must start with /memories).")
+    insert_line: int = Field(description="0-based line index at which to insert.")
+    insert_text: str = Field(description="Text to insert (a trailing newline is added).")
+
+
+class _DeleteOp(BaseModel):
+    """Delete the file or directory at ``path``."""
+    op: Literal["delete"]
+    path: str = Field(description="Absolute memory path (must start with /memories).")
+
+
+class _RenameOp(BaseModel):
+    """Rename or move a file or directory."""
+    op: Literal["rename"]
+    old_path: str = Field(description="Existing absolute memory path.")
+    new_path: str = Field(description="Destination absolute memory path.")
+
+
+type _MemoryOpUnion = Annotated[
+    _CreateOp | _ViewOp | _StrReplaceOp | _InsertOp | _DeleteOp | _RenameOp,
+    Field(discriminator="op"),
+]
+
+
+class _OpenAIMemorySchema(BaseModel):
+    """OpenAI-targeted memory tool schema.
+
+    A single ``memory_op`` field carrying a discriminated union over
+    the six memory commands. Top level is still ``type: "object"`` so
+    OpenAI strict-mode validation works."""
+    memory_op: _MemoryOpUnion = Field(
+        description=(
+            "The memory operation to perform. The 'op' tag selects the variant; "
+            "each variant carries only the fields relevant to that operation."
+        ),
+    )
+
+type ErrHandler[R] = Callable[[str], R]
+
+def _dispatch_openai_op[R](
+    backend: MemoryToolImpl[R],
+    op: _MemoryOpUnion,
+    err_handler: ErrHandler
+) -> R:
+    """Route a parsed sum-type variant into the backend's typed methods."""
+    match op:
+        case _CreateOp(path=p, file_text=ft):
+            return backend.create(p, ft)
+        case _ViewOp(path=p, view_range=vr):
+            rng: tuple[int, int] | None = None
+            if vr is not None and len(vr) == 2:
+                rng = (vr[0], vr[1])
+            elif vr is not None:
+                return err_handler(f"Error: view range invalid, expected an array of exactly 2 elements, received {len(vr)}")
+            return backend.view(p, rng)
+        case _StrReplaceOp(path=p, old_str=os_, new_str=ns):
+            return backend.str_replace(p, os_, ns)
+        case _InsertOp(path=p, insert_line=il, insert_text=it):
+            return backend.insert(p, il, it)
+        case _DeleteOp(path=p):
+            return backend.delete(p)
+        case _RenameOp(old_path=op_, new_path=np):
+            return backend.rename(op_, np)
+
+
+_OPENAI_MEMORY_TOOL_DESCRIPTION = """\
+Persistent filesystem-style memory that survives across turns and
+across conversations within this workflow. All paths live under
+``/memories`` and are sandboxed there. Use this tool to record
+intermediate observations, decisions, partial results, and any
+context you want to recall later — anything not written here is
+forgotten when the conversation ends.
+
+The ``memory_op`` field selects the operation. Each variant carries
+only the fields that operation needs:
+
+- ``view``: read a file (optionally a line range) or list a directory.
+- ``create``: write a brand-new file.
+- ``str_replace``: replace a unique substring in an existing file.
+- ``insert``: insert a line at a specific index in an existing file.
+- ``delete``: remove a file or directory.
+- ``rename``: move/rename a file or directory.
+
+Prefer ``view`` before ``create`` to avoid clobbering, and prefer
+``str_replace`` over rewriting a whole file when only part changes.
+"""
+
+
+def openai_async_memory_tool(
+    backend: MemoryToolImpl[Awaitable[str]],
+) -> BaseTool:
+    async def err_handler(s: str) -> str:
+        return s
+
+    """Async OpenAI-flavored memory tool. Same backend contract as
+    :func:`async_memory_tool`; differs only in the tool-args schema
+    seen by the model."""
+
+    class OpenAIMemoryTool(WithAsyncImplementation[str], _OpenAIMemorySchema):
+        __doc__ = _OPENAI_MEMORY_TOOL_DESCRIPTION
+
+        @override
+        async def run(self) -> str:
+            return await _dispatch_openai_op(backend, self.memory_op, err_handler)
+    return OpenAIMemoryTool.as_tool("memory")
+
+
+def openai_memory_tool(backend: MemoryToolImpl[str]) -> BaseTool:
+    """Sync OpenAI-flavored memory tool. Companion to
+    :func:`memory_tool`."""
+
+    class OpenAIMemoryTool(WithImplementation[str], _OpenAIMemorySchema):
+        __doc__ = _OPENAI_MEMORY_TOOL_DESCRIPTION
+
+        @override
+        def run(self) -> str:
+            return _dispatch_openai_op(backend, self.memory_op, lambda s: s)
+    return OpenAIMemoryTool.as_tool("memory")

@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.prebuilt import ToolNode
 
-from graphcore.tools.memory import MemoryBackendError, MemoryToolImpl, memory_tool
+from graphcore.tools.memory import MemoryBackendError, MemoryToolImpl, anthropic_memory_tool as memory_tool
 
 from .conftest import AnyBackend, BackendFactory
 
