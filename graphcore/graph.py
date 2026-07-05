@@ -13,6 +13,7 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import contextvars
 import logging
 from typing import Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
 from typing_extensions import TypedDict
@@ -20,7 +21,7 @@ from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, Huma
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import Runnable, RunnableLambda
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Checkpointer
@@ -45,6 +46,56 @@ def _log_usage(msg: BaseMessage) -> None:
     logger.info(
         f"LLM call ({model}): input={u['input_tokens']} output={u['output_tokens']} cache_read={u['cache_read_input_tokens']} cache_write={u['cache_creation_input_tokens']}",
     )
+
+
+class IncompleteToolCallError(RuntimeError):
+    """A tool call was truncated mid-arguments by the output token cap.
+
+    Raised only when *both* signals coincide: the producing response stopped on
+    ``max_tokens`` *and* the resulting tool call is missing a required argument.
+    Together these mean the arguments were cut off mid-generation — retrying just
+    reproduces the same truncation, so we fail loudly instead of feeding the
+    validation error back into the loop. Raise --tokens (or the model's max_tokens
+    setting) and re-run.
+
+    A missing field *without* truncation is treated as an ordinary recoverable
+    mistake (the model emitted the wrong shape) and handed back for a retry.
+    """
+
+
+# Carries the ``stop_reason`` of the AIMessage whose tool calls are currently being
+# executed. Set by the tools-node shim immediately before delegating to ``ToolNode``;
+# read by ``_tool_error_handler``. ToolNode's parallel tool tasks inherit a copy of
+# this context at spawn time, so the value is visible inside the handler.
+_active_stop_reason: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "graphcore_active_stop_reason", default=None
+)
+
+
+def _latest_ai_stop_reason(messages: list[AnyMessage]) -> str | None:
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            return (m.response_metadata or {}).get("stop_reason")
+    return None
+
+
+def _tool_error_handler(e: ToolInvocationError | ValidationError) -> str:
+    """Decide whether a tool-arg error is retryable or fatal.
+
+    `ToolNode` calls this for arg-validation failures. The default is to hand the
+    error back to the model as a message so it can correct itself — wrong type, bad
+    enum value, or even a forgotten field are all recoverable that way. The one
+    exception is a *missing required field on a response that hit the output token
+    cap*: that combination means the arguments were cut off mid-generation, where a
+    retry reproduces the truncation and the loop wedges. We re-raise only that case.
+    """
+    source = e.source if isinstance(e, ToolInvocationError) else e
+    message = e.message if isinstance(e, ToolInvocationError) else repr(e)
+    truncated = _active_stop_reason.get() == "max_tokens"
+    has_missing_field = any(detail.get("type") == "missing" for detail in source.errors())
+    if truncated and has_missing_field:
+        raise IncompleteToolCallError(message) from e
+    return message
 
 """
 This provides the framework for building applications which loop with an LLM,
@@ -816,7 +867,26 @@ def _build_workflow(
 
     # Create initial node and tool node with curried LLM
     init_node = init_fact(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
-    tool_node = ToolNode(tool_impls, handle_tool_errors=(ValidationError,ToolInvocationError))
+    _raw_tool_node = ToolNode(tool_impls, handle_tool_errors=_tool_error_handler)
+
+    # Thin shim that records the producing AIMessage's stop_reason before running the
+    # tools, so _tool_error_handler can distinguish a truncated tool call from a
+    # forgotten field. We delegate to the real ToolNode for actual execution.
+    def _run_tools(state: StateT) -> Any:
+        token = _active_stop_reason.set(_latest_ai_stop_reason(state["messages"]))
+        try:
+            return _raw_tool_node.invoke(state)
+        finally:
+            _active_stop_reason.reset(token)
+
+    async def _arun_tools(state: StateT) -> Any:
+        token = _active_stop_reason.set(_latest_ai_stop_reason(state["messages"]))
+        try:
+            return await _raw_tool_node.ainvoke(state)
+        finally:
+            _active_stop_reason.reset(token)
+
+    tool_node = RunnableLambda(_run_tools, afunc=_arun_tools)
     tool_result_node = result_fact(state_class, llm)
 
     # Build the graph with fixed input schema, no context
