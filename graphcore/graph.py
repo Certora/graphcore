@@ -14,9 +14,14 @@
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging
-from typing import Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast, Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
+from typing import (
+    Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast,
+    Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
+)
 from typing_extensions import TypedDict
-from langchain_core.messages import ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
+from langchain_core.messages import (
+    ToolMessage, AnyMessage, SystemMessage, HumanMessage, BaseMessage, AIMessage, RemoveMessage
+)
 from langchain_core.tools import InjectedToolCallId, BaseTool
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -154,6 +159,9 @@ class AsyncNodeFunction(Protocol[InputType, OutputType]):
     def __call__(self, state: InputType) -> Coroutine[Any, Any, OutputType]:
         ...
 
+type MessagePayloadType = str | list[str | dict] | dict
+type RawMessageType = str | dict
+
 type ChatNodeFunction[InputType] = NodeFunction[InputType, dict[str, list[BaseMessage]]]
 type AsyncChatNodeFunction[InputType] = AsyncNodeFunction[InputType, dict[str, list[BaseMessage]]]
 type AnyChatNodeFunction[StateT] = AsyncChatNodeFunction[StateT] | ChatNodeFunction[StateT]
@@ -268,8 +276,8 @@ class _ResultFact(Protocol):
         ...
 
 def _get_summarizer_pure(
-    system_prompt: str,
-    initial_prompt: str | dict,
+    system_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     state_type: type[StateT],
     context: SummaryConfig[StateT]
 ) -> PureFunction:
@@ -289,11 +297,11 @@ def _get_summarizer_pure(
             resume_message = config.get_resume_prompt(state, summary)
             config.on_summary(state, summary, resume_message)
             # Handle initial_prompt as either str or dict (with cache_control)
-            initial_content: list[str | dict] = [initial_prompt]
+            initial_content: list[str | dict] = _normalize_list(initial_prompt)
             return {
                 "messages": [
                     RemoveMessage(id="__remove_all__"),
-                    SystemMessage(content=system_prompt),
+                    SystemMessage(content=_normalize(system_prompt)),
                     HumanMessage(content=initial_content, display_tag="initial_prompt"),
                     HumanMessage(content=resume_message, display_tag="resume"),
                 ]
@@ -318,11 +326,28 @@ def _default_conversation_node(state: MessagesState) -> dict[str, list[BaseMessa
 I = TypeVar("I", bound=FlowInput)
 O = TypeVar("O")
 
+def _normalize(
+    s: MessagePayloadType
+) -> str | list[str | dict]:
+    if isinstance(s, dict):
+        return [s]
+    else:
+        return s
+
+def _normalize_list(
+    s: MessagePayloadType
+) -> list[RawMessageType]:
+    if isinstance(s, dict) or isinstance(s, str):
+        return [s]
+    else:
+        return s.copy()
+    
+
 def _get_initial_pure(
     t: Type[I],
     output_state: Type[O],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
 ) -> PureFunction[I, O]:
     def impl(
         state: I
@@ -333,15 +358,15 @@ def _get_initial_pure(
         """
         initial_messages : List[AnyMessage] = [
             SystemMessage(
-                sys_prompt
+                _normalize(sys_prompt)
             )
         ]
         front = state.get("front_matter", None)
         if front is not None:
-            app = cast(List[HumanMessage], front)
+            app = cast(list[HumanMessage], front)
             initial_messages.extend(app)
 
-        prompt_and_input_message: List[str | dict] = [initial_prompt]
+        prompt_and_input_message: list[str | dict] = _normalize_list(initial_prompt)
         prompt_and_input_message.extend(state["input"])
 
         initial_messages.append(
@@ -371,8 +396,8 @@ def _get_initial_pure(
 
 def get_summarizer(
     llm: LLM,
-    system_prompt: str,
-    initial_prompt: str | dict,
+    system_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     state_type: type[StateT],
     context: SummaryConfig[StateT]
 ) -> ChatNodeFunction[StateT]:
@@ -383,8 +408,8 @@ def get_summarizer(
 
 def get_async_summarizer(
     llm: LLM,
-    system_prompt: str,
-    initial_prompt: str | dict,
+    system_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     state_type: type[StateT],
     context: SummaryConfig[StateT]
 ) -> AsyncChatNodeFunction[StateT]:
@@ -397,8 +422,8 @@ class _SummarizerFact(Protocol):
     def __call__(
         self,
         llm: LLM,
-        system_prompt: str,
-        initial_prompt: str | dict,
+        system_prompt: MessagePayloadType,
+        initial_prompt: MessagePayloadType,
         state_type: type[StateT],
         context: SummaryConfig[StateT]
     ) -> AnyChatNodeFunction[StateT]:
@@ -407,8 +432,8 @@ class _SummarizerFact(Protocol):
 def initial_node(
     t: Type[InputState],
     output_state: Type[StateT],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     llm: LLM
 ) -> NodeFunction[InputState, StateT]:
     return _stitch_sync_impl(
@@ -419,8 +444,8 @@ def initial_node(
 def async_initial_node(
     t: Type[InputState],
     output_state: Type[StateT],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     llm: LLM
 ) -> AsyncNodeFunction[InputState, StateT]:
     return _stitch_async_impl(
@@ -433,8 +458,8 @@ class _InitialFact(Protocol):
         self,
         t: Type[InputState],
         output_state: Type[StateT],
-        sys_prompt: str,
-        initial_prompt: str | dict,
+        sys_prompt: MessagePayloadType,
+        initial_prompt: MessagePayloadType,
         llm: LLM
     ) -> AnyNodeFunction[InputState, StateT]:
         ...
@@ -467,8 +492,8 @@ class Builder(
     Generic[_BStateT, _BContextT, _BInputT]
 ):
     def __init__(self):
-        self._initial_prompt : str | None = None
-        self._sys_prompt : str | None = None
+        self._initial_prompt : MessagePayloadType | None = None
+        self._sys_prompt : MessagePayloadType | None = None
 
         self._summary_config : SummaryConfig[_BStateT] | None = None
         self._unbound_llm : BaseChatModel | None = None
@@ -539,7 +564,7 @@ class Builder(
         to_ret._conversation_handler = self._conversation_handler
         return to_ret
 
-    def with_initial_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+    def with_initial_prompt(self, prompt: MessagePayloadType) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_untyped_to_(to_ret)
         self._copy_typed_to(to_ret)
@@ -677,8 +702,8 @@ def build_workflow(
     state_class: Type[StateT],
     input_type: Type[InputState],
     tools_list: Iterable[BaseTool | SplitTool],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     output_key: str,
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
@@ -706,8 +731,8 @@ def build_async_workflow(
     state_class: Type[StateT],
     input_type: Type[InputState],
     tools_list: Iterable[BaseTool | SplitTool],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     output_key: str,
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
@@ -734,8 +759,8 @@ def _build_workflow(
     state_class: Type[StateT],
     input_type: Type[InputState],
     tools_list: Iterable[BaseTool | SplitTool],
-    sys_prompt: str,
-    initial_prompt: str | dict,
+    sys_prompt: MessagePayloadType,
+    initial_prompt: MessagePayloadType,
     output_key: str,
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]],
