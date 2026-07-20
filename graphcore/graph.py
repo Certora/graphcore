@@ -231,31 +231,54 @@ def _stitch_async_impl(
             return e.value
     return impl
 
+type MonitorReturn = tuple[list[AnyMessage] | None, dict[str, Any] | None]
+
+class StateMonitor[ST: MessagesState](Protocol):
+    def __call__(self, curr_state: ST, /) -> MonitorReturn:
+        ...
+        
+
 def _pure_tool_generator(
-    t: type[StateT]
+    t: type[StateT],
+    monitor: StateMonitor[StateT] | None = None
 ) -> PureFunction[StateT, dict[str, list[BaseMessage]]]:
     def impl(
-        state: MessagesState
+        state: StateT
     ) -> PureFunctionGenerator[dict[str, list[BaseMessage]]]:
-        res = yield state["messages"]
-        return {"messages": [res]}
+        to_send = state["messages"]
+        to_add : list[AnyMessage] = []
+        state_update : dict[str, Any] | None = None
+        if monitor is not None:
+            add_message, state_update = monitor(state)
+            if add_message is not None:
+                to_add.extend(to_add)
+
+                to_send = to_send.copy()
+                to_send.extend(to_add)
+
+        res = yield to_send
+        if state_update is None:
+            state_update = {}
+        return {"messages": [*to_add, res], **state_update}
     return impl
 
 def tool_result_generator(
     t: type[StateT],
+    monitor: Callable[[StateT], MonitorReturn] | None,
     llm: Runnable[LanguageModelInput, BaseMessage],
 ) -> ChatNodeFunction[StateT]:
     return _stitch_sync_impl(
-        _pure_tool_generator(t),
+        _pure_tool_generator(t, monitor),
         _sync_llm(llm)
     )
 
 def async_tool_result_generator(
     t: type[StateT],
+    monitor: Callable[[StateT], MonitorReturn] | None,
     llm: LLM
 ) -> AsyncChatNodeFunction[StateT]:
     return _stitch_async_impl(
-        _pure_tool_generator(t),
+        _pure_tool_generator(t, monitor),
         _async_llm(llm)
     )
 
@@ -263,6 +286,7 @@ class _ResultFact(Protocol):
     def __call__(
         self,
         t: type[StateT],
+        monitor: StateMonitor[StateT] | None,
         llm: LLM
     ) -> AnyChatNodeFunction[StateT]:
         ...
@@ -480,6 +504,7 @@ class Builder(
         self._tools : list[BaseTool | SplitTool] = []
         self._loader : TemplateLoader | None = None
         self._conversation_handler : AnyChatNodeFunction[_BStateT] | None = None
+        self._monitor : Callable[[_BStateT], MonitorReturn] | None = None
         self._checkpointer : None | Checkpointer = None
 
     def _copy_untyped_to_(self, other: "Builder[Any, Any, Any]"):
@@ -497,6 +522,7 @@ class Builder(
         other._input_type = self._input_type
         other._summary_config = self._summary_config
         other._conversation_handler = self._conversation_handler
+        other._monitor = self._monitor
 
     def with_state(self, t: type[_BStateBind]) -> "Builder[_BStateBind, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateBind, _BContextT, _BInputT]" = Builder()
@@ -514,6 +540,7 @@ class Builder(
         to_ret._input_type = self._input_type
         to_ret._summary_config = self._summary_config
         to_ret._conversation_handler = self._conversation_handler
+        to_ret._monitor = self._monitor
         return to_ret
 
     def with_checkpointer(self, checkpointer: Checkpointer) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -537,6 +564,7 @@ class Builder(
         to_ret._input_type = t
         to_ret._summary_config = self._summary_config
         to_ret._conversation_handler = self._conversation_handler
+        to_ret._monitor = self._monitor
         return to_ret
 
     def with_initial_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -582,6 +610,15 @@ class Builder(
         self._copy_untyped_to_(to_ret)
         self._copy_typed_to(to_ret)
         to_ret._output_key = key
+        return to_ret
+
+    def with_monitor(self, monitor: Callable[[_BStateT], MonitorReturn]) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        assert self._state_class is not None, "Set monitor on stateless builder"
+        to_ret : "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
+        self._copy_untyped_to_(to_ret)
+        self._copy_typed_to(to_ret)
+
+        to_ret._monitor = monitor
         return to_ret
 
     def with_summary_config(self, config: SummaryConfig[_BStateT]) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -683,7 +720,8 @@ def build_workflow(
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
     context_schema: Optional[Type[ContextT]] = None,
-    summary_config: SummaryConfig[StateT] | None = None
+    summary_config: SummaryConfig[StateT] | None = None,
+    monitor: Callable[[StateT], MonitorReturn] | None = None
 ) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     return _build_workflow(
         state_class,
@@ -696,6 +734,7 @@ def build_workflow(
         output_schema,
         context_schema,
         summary_config,
+        monitor,
         tool_result_generator,
         initial_node,
         get_summarizer,
@@ -712,7 +751,8 @@ def build_async_workflow(
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
     context_schema: Optional[Type[ContextT]] = None,
-    summary_config: SummaryConfig[StateT] | None = None
+    summary_config: SummaryConfig[StateT] | None = None,
+    monitor: Callable[[StateT], MonitorReturn] | None = None
 ) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     return _build_workflow(
         state_class,
@@ -725,6 +765,7 @@ def build_async_workflow(
         output_schema,
         context_schema,
         summary_config,
+        monitor,
         async_tool_result_generator,
         async_initial_node,
         get_async_summarizer,
@@ -741,6 +782,7 @@ def _build_workflow(
     output_schema: Optional[Type[OutputT]],
     context_schema: Optional[Type[ContextT]],
     summary_config: SummaryConfig[StateT] | None,
+    monitor: Callable[[StateT], MonitorReturn] | None,
     result_fact: _ResultFact,
     init_fact: _InitialFact,
     summary_fact: _SummarizerFact,
@@ -817,7 +859,7 @@ def _build_workflow(
     # Create initial node and tool node with curried LLM
     init_node = init_fact(input_type, state_class, sys_prompt=sys_prompt, initial_prompt=initial_prompt, llm=llm)
     tool_node = ToolNode(tool_impls, handle_tool_errors=(ValidationError,ToolInvocationError))
-    tool_result_node = result_fact(state_class, llm)
+    tool_result_node = result_fact(state_class, monitor, llm)
 
     # Build the graph with fixed input schema, no context
     builder = StateGraph(
