@@ -715,6 +715,7 @@ class Builder(
             unbound_llm=self._unbound_llm,
             context_schema=self._context_type,
             summarization=summarization, #type: ignore
+            monitor=self._monitor, #type: ignore
             init_fact=i,
             result_fact=r,
             summary_fact=s,
