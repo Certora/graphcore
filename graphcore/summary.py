@@ -15,6 +15,7 @@
 
 import logging
 
+from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 StateT = TypeVar("StateT", contravariant=True)
@@ -50,3 +51,13 @@ IMPORTANT: You are resuming this task already in progress. A summary of your rec
     # default, do nothing, this is for auditing purposes
     def on_summary(self, state: StateT, summary: str, resume: str) -> None:
         pass
+
+
+@dataclass(frozen=True)
+class Summarization[StateT]:
+    """Everything a workflow needs in order to compact its history. The two travel together
+    because neither is any use alone: `max_prompt_tokens` is the threshold `config` gets applied
+    at, and graphcore cannot derive it from the chat model it was handed — whoever chose the model
+    supplies it."""
+    config: SummaryConfig[StateT]
+    max_prompt_tokens: int

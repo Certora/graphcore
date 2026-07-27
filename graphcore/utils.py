@@ -115,22 +115,6 @@ def current_prompt_tokens(messages: List[AnyMessage]) -> int:
     return 0
 
 
-def default_max_prompt_tokens(model_name: str | None) -> int:
-    """
-    Prompt-token threshold at which to compact history. Keep this conservatively below the model's
-    context window to leave room for output, thinking budget, and the next batch of tool results.
-    Add a new case here when introducing a new model.
-    """
-    match model_name:
-        case "claude-opus-4-6":
-            return 500_000   # 1M context window
-        case "claude-sonnet-4-6":
-            return 500_000   # 1M context window
-        case "claude-opus-4-7":
-            return 500_000   # 1M context window
-        case _:
-            return 100_000   # fallback for unknown models
-
 
 # ---------------------------------------------------------------------------
 # Content normalization for LLM invocation

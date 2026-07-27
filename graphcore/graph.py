@@ -35,8 +35,8 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
-from .utils import ainvoke, invoke, current_prompt_tokens, default_max_prompt_tokens, get_token_usage
-from .summary import SummaryConfig
+from .utils import ainvoke, invoke, current_prompt_tokens, get_token_usage
+from .summary import SummaryConfig, Summarization
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,7 @@ type MonitorReturn = tuple[list[AnyMessage] | None, dict[str, Any] | None]
 class StateMonitor[ST: MessagesState](Protocol):
     def __call__(self, curr_state: ST, /) -> MonitorReturn:
         ...
-        
+
 
 def _pure_tool_generator(
     t: type[StateT],
@@ -365,7 +365,7 @@ def _normalize_list(
         return [s]
     else:
         return s.copy()
-    
+
 
 def _get_initial_pure(
     t: Type[I],
@@ -521,6 +521,7 @@ class Builder(
 
         self._summary_config : SummaryConfig[_BStateT] | None = None
         self._unbound_llm : BaseChatModel | None = None
+        self._max_prompt_tokens : int | None = None
 
         self._state_class: type[_BStateT] | None = None
         self._input_type : type[_BInputT] | None = None
@@ -536,6 +537,7 @@ class Builder(
         other._initial_prompt = self._initial_prompt
         other._sys_prompt = self._sys_prompt
         other._unbound_llm = self._unbound_llm
+        other._max_prompt_tokens = self._max_prompt_tokens
         other._output_key = self._output_key
         other._tools.extend(self._tools)
         other._loader = self._loader
@@ -623,11 +625,17 @@ class Builder(
         to_ret._loader = loader
         return to_ret
 
-    def with_llm(self, llm: BaseChatModel) -> "Builder[_BStateT, _BContextT, _BInputT]":
+    def with_llm(
+        self, llm: BaseChatModel, *, max_prompt_tokens: int
+    ) -> "Builder[_BStateT, _BContextT, _BInputT]":
+        """Bind the model, and with it the prompt-token threshold at which history is compacted.
+        The threshold belongs here because it is a property of `llm`: graphcore sees only an opaque
+        chat model and cannot infer a context window. Only read when a summary config is set."""
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_untyped_to_(to_ret)
         self._copy_typed_to(to_ret)
         to_ret._unbound_llm = llm
+        to_ret._max_prompt_tokens = max_prompt_tokens
         return to_ret
 
     def with_output_key(self, key: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -688,6 +696,14 @@ class Builder(
             raise ValueError("output_key is required")
         if self._unbound_llm is None:
             raise ValueError("unbound_llm is required")
+        if self._max_prompt_tokens is None:
+            raise ValueError("max_prompt_tokens is required")
+
+        summarization = (
+            Summarization(self._summary_config, self._max_prompt_tokens)
+            if self._summary_config is not None
+            else None
+        )
 
         return _build_workflow(
             state_class=self._state_class, #type: ignore
@@ -698,7 +714,7 @@ class Builder(
             output_key=self._output_key,
             unbound_llm=self._unbound_llm,
             context_schema=self._context_type,
-            summary_config=self._summary_config, #type: ignore
+            summarization=summarization, #type: ignore
             init_fact=i,
             result_fact=r,
             summary_fact=s,
@@ -745,7 +761,7 @@ def build_workflow(
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
     context_schema: Optional[Type[ContextT]] = None,
-    summary_config: SummaryConfig[StateT] | None = None,
+    summarization: Summarization[StateT] | None = None,
     monitor: Callable[[StateT], MonitorReturn] | None = None
 ) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     return _build_workflow(
@@ -758,7 +774,7 @@ def build_workflow(
         unbound_llm,
         output_schema,
         context_schema,
-        summary_config,
+        summarization,
         monitor,
         tool_result_generator,
         initial_node,
@@ -776,7 +792,7 @@ def build_async_workflow(
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]] = None,
     context_schema: Optional[Type[ContextT]] = None,
-    summary_config: SummaryConfig[StateT] | None = None,
+    summarization: Summarization[StateT] | None = None,
     monitor: Callable[[StateT], MonitorReturn] | None = None
 ) -> Tuple[StateGraph[StateT, ContextT, InputState, OutputT], LLM]:
     return _build_workflow(
@@ -789,12 +805,13 @@ def build_async_workflow(
         unbound_llm,
         output_schema,
         context_schema,
-        summary_config,
+        summarization,
         monitor,
         async_tool_result_generator,
         async_initial_node,
         get_async_summarizer,
     )
+
 
 def _build_workflow(
     state_class: Type[StateT],
@@ -806,7 +823,7 @@ def _build_workflow(
     unbound_llm: BaseChatModel,
     output_schema: Optional[Type[OutputT]],
     context_schema: Optional[Type[ContextT]],
-    summary_config: SummaryConfig[StateT] | None,
+    summarization: Summarization[StateT] | None,
     monitor: Callable[[StateT], MonitorReturn] | None,
     result_fact: _ResultFact,
     init_fact: _InitialFact,
@@ -835,7 +852,8 @@ def _build_workflow(
         unbound_llm: The llm to use for the computation and looping
         output_schema: (Optional) if non-none, describes the output format of the computation.
         context_schema: (Optional) if non-none, the type of contexts passed through the computation
-        summary_config: if non-none, the parameters and prompts for history summarization.
+        summarization: if non-none, the prompts and prompt-token threshold for history \
+            compaction. Omit it and the workflow never summarizes.
         no_tools_fn: (Optional) node function for when the AI responds without tool calls.
             Defaults to scolding. Used by conversation mode to interrupt for human input instead.
 
@@ -907,10 +925,12 @@ def _build_workflow(
     builder.add_conditional_edges(TOOL_RESULT_NODE, ai_message_router)
     builder.add_edge(NO_TOOLS_NODE, TOOL_RESULT_NODE)
 
-    if summary_config is not None:
-        model_name = getattr(unbound_llm, "model", None)
-        threshold = default_max_prompt_tokens(model_name)
-        logger.info(f"Summarization threshold: {threshold} prompt tokens (model={model_name})")
+    if summarization is not None:
+        threshold = summarization.max_prompt_tokens
+        logger.info(
+            f"Summarization threshold: {threshold} prompt tokens "
+            f"(model={getattr(unbound_llm, 'model', None)})"
+        )
 
         def routing(state: StateT) -> Literal["summarize", "tool_result", "__end__"]:
             if state.get(output_key, None) is not None:
@@ -921,7 +941,7 @@ def _build_workflow(
                 return "tool_result"
 
         summarizer = summary_fact(
-            unbound_llm, sys_prompt, initial_prompt, state_class, summary_config
+            unbound_llm, sys_prompt, initial_prompt, state_class, summarization.config
         )
         builder.add_node(SUMMARIZE_NODE, summarizer)
         builder.add_edge(SUMMARIZE_NODE, TOOL_RESULT_NODE)
