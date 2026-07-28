@@ -259,7 +259,7 @@ def _pure_tool_generator(
         if monitor is not None:
             add_message, state_update = monitor(state)
             if add_message is not None:
-                to_add.extend(to_add)
+                to_add.extend(add_message)
 
                 to_send = to_send.copy()
                 to_send.extend(to_add)
