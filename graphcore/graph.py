@@ -16,7 +16,8 @@
 import logging
 from typing import (
     Optional, List, Annotated, Literal, TypeVar, Type, Protocol, cast,
-    Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine
+    Any, Tuple, NotRequired, Iterable, Generic, Callable, Generator, Awaitable, Coroutine,
+    final
 )
 from typing_extensions import TypedDict
 from langchain_core.messages import (
@@ -159,8 +160,21 @@ class AsyncNodeFunction(Protocol[InputType, OutputType]):
     def __call__(self, state: InputType) -> Coroutine[Any, Any, OutputType]:
         ...
 
+
+class TemplateLoader(Protocol):
+    def __call__(self, template_name: str, **kwargs: Any) -> str: ...
+
 type MessagePayloadType = str | list[str | dict] | dict
 type RawMessageType = str | dict
+
+@final
+class CacheMarker:
+    ...
+
+type RawPromptInput = Callable[[TemplateLoader], str] | str | dict
+type PromptInput = RawPromptInput | list[RawPromptInput | type[CacheMarker]]
+
+type CacheManager = Callable[[RawMessageType], RawMessageType]
 
 type ChatNodeFunction[InputType] = NodeFunction[InputType, dict[str, list[BaseMessage]]]
 type AsyncChatNodeFunction[InputType] = AsyncNodeFunction[InputType, dict[str, list[BaseMessage]]]
@@ -508,10 +522,6 @@ _BInputT = TypeVar("_BInputT", bound=FlowInput | None)
 _BInputTBind = TypeVar("_BInputTBind", bound=FlowInput)
 
 
-class TemplateLoader(Protocol):
-    def __call__(self, template_name: str, **kwargs: Any) -> str: ...
-
-
 class Builder(
     Generic[_BStateT, _BContextT, _BInputT]
 ):
@@ -532,6 +542,33 @@ class Builder(
         self._conversation_handler : AnyChatNodeFunction[_BStateT] | None = None
         self._monitor : Callable[[_BStateT], MonitorReturn] | None = None
         self._checkpointer : None | Checkpointer = None
+        self._cache_manager : None | CacheManager = None
+
+    def _normalize_prompt(self, to_normalize: PromptInput) -> MessagePayloadType:
+        if isinstance(to_normalize, (str, dict)):
+            return to_normalize
+        if callable(to_normalize):
+            if self._loader is None:
+                raise ValueError(f"Injected template received but no loader set")
+            return to_normalize(self._loader)
+        to_ret : list[str | dict] = []
+        assert isinstance(to_normalize, list)
+        for (ind, d) in enumerate(to_normalize):
+            if d is CacheMarker:
+                if ind == 0:
+                    raise ValueError("Cannot start with cache marker")
+                if self._cache_manager is not None:
+                    to_ret[-1] = self._cache_manager(to_ret[-1])
+            elif isinstance(d, (str, dict)):
+                to_ret.append(d)
+            else:
+                assert callable(d)
+                if self._loader is None:
+                    raise ValueError("Injected template received but no loader set")
+                to_ret.append(d(self._loader))
+        if not to_ret:
+            raise ValueError("Empty prompt")
+        return to_ret
 
     def _copy_untyped_to_(self, other: "Builder[Any, Any, Any]"):
         other._initial_prompt = self._initial_prompt
@@ -542,6 +579,7 @@ class Builder(
         other._tools.extend(self._tools)
         other._loader = self._loader
         other._checkpointer = self._checkpointer
+        other._cache_manager = self._cache_manager
 
     def _copy_typed_to(self, other: "Builder[_BStateT, _BContextT, _BInputT]"):
         other._state_class = self._state_class
@@ -594,11 +632,11 @@ class Builder(
         to_ret._monitor = self._monitor
         return to_ret
 
-    def with_initial_prompt(self, prompt: MessagePayloadType) -> "Builder[_BStateT, _BContextT, _BInputT]":
+    def with_initial_prompt(self, prompt: PromptInput) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_untyped_to_(to_ret)
         self._copy_typed_to(to_ret)
-        to_ret._initial_prompt = prompt
+        to_ret._initial_prompt = self._normalize_prompt(prompt)
         return to_ret
 
     def with_initial_prompt_template(self, template: str, **kwargs) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -606,11 +644,11 @@ class Builder(
             raise ValueError("No loader configured. Use with_loader first.")
         return self.with_initial_prompt(self._loader(template, **kwargs))
 
-    def with_sys_prompt(self, prompt: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
+    def with_sys_prompt(self, prompt: PromptInput) -> "Builder[_BStateT, _BContextT, _BInputT]":
         to_ret: "Builder[_BStateT, _BContextT, _BInputT]" = Builder()
         self._copy_untyped_to_(to_ret)
         self._copy_typed_to(to_ret)
-        to_ret._sys_prompt = prompt
+        to_ret._sys_prompt = self._normalize_prompt(prompt)
         return to_ret
 
     def with_sys_prompt_template(self, template: str, **kwargs) -> "Builder[_BStateT, _BContextT, _BInputT]":
@@ -626,7 +664,7 @@ class Builder(
         return to_ret
 
     def with_llm(
-        self, llm: BaseChatModel, *, max_prompt_tokens: int
+        self, llm: BaseChatModel, *, max_prompt_tokens: int, manager: CacheManager | None = None
     ) -> "Builder[_BStateT, _BContextT, _BInputT]":
         """Bind the model, and with it the prompt-token threshold at which history is compacted.
         The threshold belongs here because it is a property of `llm`: graphcore sees only an opaque
@@ -636,6 +674,7 @@ class Builder(
         self._copy_typed_to(to_ret)
         to_ret._unbound_llm = llm
         to_ret._max_prompt_tokens = max_prompt_tokens
+        to_ret._cache_manager = manager
         return to_ret
 
     def with_output_key(self, key: str) -> "Builder[_BStateT, _BContextT, _BInputT]":
