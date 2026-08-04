@@ -44,14 +44,6 @@ def _copy_base_doc[T: type](cls: T) -> T:
     return cls
 
 
-# returns true if the file is okay to access
-def _make_checker(patt: str | None) -> Callable[[str], bool]:
-    if patt is None:
-        return lambda f_name: True
-    match = re.compile(patt)
-    return lambda f_name: match.fullmatch(f_name) is None
-
-
 # Always-on exclude floor. ``.git`` is never useful for any consumer
 # (VFS tools, materialization, audit) — including it is pure waste at
 # best and actively misleading at worst (every workflow would re-snapshot
@@ -65,14 +57,27 @@ def _floor_exclude(path: str) -> bool:
     return ".git" in pathlib.PurePosixPath(path).parts
 
 
-# Type alias for the user-facing ``global_exclude`` config. Both forms
-# return True to *exclude* the path. The callable form (preferred) is
-# more natural when the predicate cares about Path semantics like
-# ``suffix`` or ``parts``; the regex form is retained for symmetry with
-# ``forbidden_read``/``forbidden_write`` but is clunky for path logic
-# (you end up writing ``(.*/)?node_modules(/.*)?`` for what's just
-# ``"node_modules" in p.parts``).
+# Type alias for the path-exclusion configs — ``global_exclude`` and the
+# ``forbidden_read``/``forbidden_write`` tool filters. Both forms return True to
+# *exclude* the path. The callable form is preferred: it is far more natural
+# whenever the rule cares about path semantics like ``suffix`` or ``parts``,
+# where the regex form gets unreadable fast (you end up writing
+# ``(.*/)?node_modules(/.*)?`` for what's just ``"node_modules" in p.parts``,
+# and expressing "but never exclude .sol" needs a lookahead). The regex form is
+# kept because it is the right shape for a pattern supplied as a CLI argument.
 type GlobalExcludeArg = str | Callable[[pathlib.PurePath], bool] | None
+
+
+def _make_exclude_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
+    """Normalize either form of :data:`GlobalExcludeArg` to one *exclude*
+    predicate over path strings (True = exclude). The single place the two
+    surface forms are interpreted."""
+    if arg is None:
+        return lambda _: False
+    if isinstance(arg, str):
+        rx = re.compile(arg)
+        return lambda p: rx.fullmatch(p) is not None
+    return lambda p: arg(pathlib.PurePosixPath(p))
 
 
 def _make_global_include_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
@@ -86,15 +91,19 @@ def _make_global_include_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
     polarity flip happens here at the boundary so internal predicate
     composition stays consistent.
     """
-    if arg is None:
-        return lambda s: not _floor_exclude(s)
-    if isinstance(arg, str):
-        rx = re.compile(arg)
-        # fullmatch for symmetry with forbidden_read/forbidden_write.
-        return lambda p: not _floor_exclude(p) and rx.fullmatch(p) is None
-    # Callable form: caller's predicate returns True to exclude. We flip.
-    user_excludes = arg
-    return lambda p: not _floor_exclude(p) and not user_excludes(pathlib.PurePosixPath(p))
+    excludes = _make_exclude_pred(arg)
+    return lambda p: not _floor_exclude(p) and not excludes(p)
+
+
+def _make_checker(arg: GlobalExcludeArg) -> Callable[[str], bool]:
+    """Returns an *access* predicate (True = okay to access) for the
+    ``forbidden_read``/``forbidden_write`` tool filters. Unlike
+    :func:`_make_global_include_pred` this carries no ``.git`` floor: these
+    filters narrow the agent's tool surface only, and the floor is applied
+    separately alongside them.
+    """
+    excludes = _make_exclude_pred(arg)
+    return lambda f_name: not excludes(f_name)
 
 class FileRange(BaseModel):
     start_line: int = Field(description="The line to start reading from; lines are numbered starting from 1.")
@@ -329,14 +338,15 @@ def _materialize(
 class VFSToolConfig(TypedDict):
     immutable: bool
     fs_layer: NotRequired[str | None]
-    forbidden_read: NotRequired[str]
-    forbidden_write: NotRequired[str]
+    # Agent-facing tool filters. Either a fullmatch regex or a
+    # ``Callable[[PurePath], bool]`` returning True to exclude (preferred for
+    # anything path-shaped). See ``fs_tools_layered`` for the contract.
+    forbidden_read: NotRequired[GlobalExcludeArg]
+    forbidden_write: NotRequired[GlobalExcludeArg]
 
     # Paths invisible to every consumer (tools, materialization, audit).
-    # Either a fullmatch regex (BC; clunky for path logic) or a
-    # ``Callable[[PurePath], bool]`` returning True to exclude
-    # (preferred). ``.git`` is always excluded; this composes on top.
-    # See ``fs_tools_layered`` for the contract.
+    # Same two forms as above. ``.git`` is always excluded; this composes
+    # on top. See ``fs_tools_layered`` for the contract.
     global_exclude: NotRequired[GlobalExcludeArg]
 
     put_doc_extra: NotRequired[str]
@@ -802,7 +812,7 @@ class _LayeredMaterializer:
 
 def fs_tools_layered(
     backends: Sequence[FSBackend],
-    forbidden_read: str | None = None,
+    forbidden_read: GlobalExcludeArg = None,
     global_exclude: GlobalExcludeArg = None,
 ) -> tuple[list[BaseTool], Materializer]:
     """Create stateless read-only filesystem tools over a layered backend stack.
@@ -810,7 +820,7 @@ def fs_tools_layered(
     ``backends`` are consulted in priority order (first wins) for ``get``,
     and unioned (with de-duplication by path) for ``list``.
 
-    ``forbidden_read`` (fullmatch regex) filters the agent-facing tool
+    ``forbidden_read`` filters the agent-facing tool
     surface only — ``get_file``/``list_files``/``grep_files``. The
     materializer still dumps every non-globally-excluded file so
     downstream consumers (e.g. solc) see a complete tree.
@@ -916,7 +926,7 @@ def fs_tools_layered(
 
 def fs_tools(
     fs_layer: str,
-    forbidden_read: str | None = None,
+    forbidden_read: GlobalExcludeArg = None,
     *,
     cache_listing: bool = True,
     global_exclude: GlobalExcludeArg = None,
@@ -930,13 +940,14 @@ def fs_tools(
 
     Args:
         fs_layer: Path to the directory to expose
-        forbidden_read: Optional regex pattern for paths that cannot be read
+        forbidden_read: Optional fullmatch regex, or a ``Callable[[PurePath], bool]``
+            returning True to exclude, selecting paths that cannot be read
         cache_listing: If True (default), cache the directory listing after first call.
             Set to False if the agent needs to react to filesystem changes.
-        global_exclude: Optional fullmatch regex for paths invisible to *every*
-            consumer (tools, materialization, audit). ``.git`` is always
-            excluded; this pattern unions on top. See
-            ``fs_tools_layered`` for the full contract.
+        global_exclude: Optional fullmatch regex, or a ``Callable[[PurePath], bool]``
+            returning True to exclude, for paths invisible to *every* consumer
+            (tools, materialization, audit). ``.git`` is always excluded; this
+            unions on top. See ``fs_tools_layered`` for the full contract.
 
     Returns:
         List of tools: [get_file, list_files, grep_files]
