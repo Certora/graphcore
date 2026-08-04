@@ -328,6 +328,52 @@ class TestForbiddenRead:
         assert (tmp_path / "a.sol").read_text() == "visible"
         assert (tmp_path / "secrets/key.txt").read_text() == "supersecret"
 
+    async def test_callable_form_filters_tool_surface(self):
+        b = InMemoryBackend({
+            "a.sol": "ok",
+            "secrets/key.txt": "supersecret",
+        })
+        tools, _ = _tools_by_name(
+            [b], forbidden_read=lambda p: "secrets" in p.parts
+        )
+        listing = tools["list_files"].invoke({}).splitlines()
+        assert "a.sol" in listing
+        assert "secrets/key.txt" not in listing
+        assert "supersecret" not in tools["get_file"].invoke({"path": "secrets/key.txt"})
+
+    async def test_callable_form_expresses_a_carve_out(self):
+        """The property a regex cannot state without a lookahead: withhold a
+        whole subtree *except* one file kind."""
+        b = InMemoryBackend({
+            "pkg/node_modules/dep/Thing.sol": "contract Thing {}",
+            "pkg/node_modules/dep/index.js": "module.exports = 1",
+            "pkg/node_modules/dep/README.md": "docs",
+        })
+        tools, _ = _tools_by_name(
+            [b],
+            forbidden_read=lambda p: p.suffix != ".sol" and "node_modules" in p.parts,
+        )
+        listing = tools["list_files"].invoke({}).splitlines()
+        assert "pkg/node_modules/dep/Thing.sol" in listing
+        assert "pkg/node_modules/dep/index.js" not in listing
+        assert "pkg/node_modules/dep/README.md" not in listing
+
+    async def test_callable_form_receives_a_posix_path(self):
+        """The predicate is handed a ``PurePosixPath``, so ``parts`` / ``suffix``
+        / ``name`` are usable regardless of the host platform."""
+        seen: list[pathlib.PurePath] = []
+
+        def record(p: pathlib.PurePath) -> bool:
+            seen.append(p)
+            return False
+
+        b = InMemoryBackend({"src/Foo.sol": "code"})
+        tools, _ = _tools_by_name([b], forbidden_read=record)
+        tools["list_files"].invoke({})
+        assert seen
+        assert all(isinstance(p, pathlib.PurePosixPath) for p in seen)
+        assert pathlib.PurePosixPath("src/Foo.sol") in seen
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: tool reads match materialized disk state
