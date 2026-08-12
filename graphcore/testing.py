@@ -13,8 +13,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, MessagesState
-from langgraph.prebuilt import ToolNode
 from langgraph._internal._typing import StateLike
+
+from .serial_tools import make_tool_node
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +227,9 @@ class InitializedScenario(Generic[STATE_TYPE]):
             responses.append(AIMessage(content="", tool_calls=tcs))
         responses.append(AIMessage(content="Done."))
 
-        tool_node = ToolNode(self.tools, handle_tool_errors=False)
+        # Built the way production builds it (graph.py), so a scenario that scripts
+        # two writers of one plain channel into a turn behaves here as it will there.
+        tool_node = make_tool_node(self.tools, handle_tool_errors=False)
         llm = FakeMessagesListChatModel(responses=responses)
 
         async def agent(state: STATE_TYPE) -> dict[str, list[BaseMessage]]:
