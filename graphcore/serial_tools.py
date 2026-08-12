@@ -57,18 +57,18 @@ _MESSAGES_KEY = "messages"
 
 
 def serialize_writes[T: BaseTool](tool: T, *state_keys: str) -> T:
-    """Declare *tool* as serialized, naming every state key it writes.
+    """Declare *tool* as serialized, naming the plain state keys it rewrites.
 
     All declaring tools of a graph form ONE group: they are serialized against
     each other, not just against themselves, because they contend for the same
-    channels. Declared keys are enforced at run time — a serialized tool that
-    writes an undeclared key raises rather than silently escaping the
-    single-write guarantee.
+    channels.
 
-    Only plain (``LastValue``) keys belong here. A reducer-backed key is safe to
-    write concurrently and must NOT be declared: this node merges the group's
-    writes by last-wins, which would drop all but the final write to a key whose
-    reducer was supposed to combine them.
+    Name only plain (``LastValue``) keys. A reducer-backed key must NOT be named —
+    the group's declared writes are merged last-wins, which would drop all but the
+    final write to a key whose reducer was meant to combine them. Naming nothing
+    is not the safe default either: an undeclared key keeps the stock
+    one-write-per-call behaviour, so a plain one written by two calls of the group
+    still collides.
     """
     if not state_keys:
         raise ValueError(
@@ -202,23 +202,26 @@ def _serializing_node(
         par = [c for c in calls if c["name"] not in exclusive]
         return _Split(at, ai, par, seq, {c["id"]: i for i, c in enumerate(calls)})
 
-    def fold(local: dict, out: Any, merged: dict, answers: list[list]) -> dict:
+    def fold(local: dict, out: Any, merged: dict, answers: list[dict]) -> dict:
         """Absorb one serialized call's result and hand back the state the next
-        call should run against."""
+        call should run against.
+
+        Only declared keys collapse into the group's single write. Anything else
+        the tool wrote — a reducer-backed channel like a validation stamp — rides
+        on that call's own update, keeping the one-write-per-call shape its reducer
+        expects, and is left out of *local* so it reaches the next tool exactly as
+        an unserialized batch would.
+        """
         update = dict(_sole_update(out))
-        answers.append(update.pop(_MESSAGES_KEY, []))
-        undeclared = set(update) - declared
-        if undeclared:
-            raise ValueError(
-                f"serialized tool wrote undeclared state key(s) {sorted(undeclared)}; "
-                "pass them to serialize_writes() (plain keys) or stop writing them "
-                "from a serialized tool (reducer-backed keys)"
-            )
-        merged.update(update)
-        return {**local, **update}
+        answer = {_MESSAGES_KEY: update.pop(_MESSAGES_KEY, [])}
+        owned = {k: v for k, v in update.items() if k in declared}
+        answer.update((k, v) for k, v in update.items() if k not in declared)
+        answers.append(answer)
+        merged.update(owned)
+        return {**local, **owned}
 
     def result(
-        par_out: Any, merged: dict, answers: list[list], order: dict[str | None, int]
+        par_out: Any, merged: dict, answers: list[dict], order: dict[str | None, int]
     ) -> list[Command]:
         items = par_out if isinstance(par_out, list) else [] if par_out is None else [par_out]
         # Everything is wrapped as a Command: LangGraph only treats a list return
@@ -227,10 +230,10 @@ def _serializing_node(
         # one-write-per-call shape that reducer-backed channels depend on.
         out = [i if isinstance(i, Command) else Command(update=i) for i in items]
         # Each serialized call answers in its own update so the batch's messages can
-        # be ordered as the model requested them; the group's collapsed state write
-        # rides on the last of them, which is what keeps it to one write per step.
-        out.extend(Command(update={_MESSAGES_KEY: msgs}) for msgs in answers[:-1])
-        out.append(Command(update={**merged, _MESSAGES_KEY: answers[-1]}))
+        # be ordered as the model requested them; the group's collapsed write of the
+        # declared keys rides on the last of them, keeping those to one per step.
+        out.extend(Command(update=a) for a in answers[:-1])
+        out.append(Command(update={**answers[-1], **merged}))
         out.sort(key=lambda c: _call_index(c, order))
         return out
 
@@ -256,7 +259,7 @@ def _serializing_node(
                 return None
             return await tool_node.ainvoke(_with_calls(input, s.at, s.ai, s.par), config)
 
-        async def run_serial() -> tuple[dict, list[list]]:
+        async def run_serial() -> tuple[dict, list[dict]]:
             local, merged, answers = input, {}, []
             for c in s.seq:
                 out = await tool_node.ainvoke(_with_calls(local, s.at, s.ai, [c]), config)
