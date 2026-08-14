@@ -94,11 +94,13 @@ def random_schema_raw() -> st.SearchStrategy[dict[str, Any]]:
 
 
 def with_permissive_schema(x: RawSchemaDef) -> tuple[type[BaseModel], type[BaseModel], type[BaseModel]]:
+    # get what pydantic thinks the types of these fields should be
     model = create_model(
         "TestModelBase",
         **x
     )
 
+    # for each such field, create a shema which erases all bounds (for ints) and makes the fields optional
     permissive_fields : dict[str, Any] = {}
     for (k, v) in model.model_fields.items():
         field_ty = cast(type, v.asdict()["annotation"])
@@ -108,6 +110,7 @@ def with_permissive_schema(x: RawSchemaDef) -> tuple[type[BaseModel], type[BaseM
         **permissive_fields
     )
 
+    # create a schema inheriting from `WithImplementation` with the field information parsed via `TestModelBase`
     tool_family_able = create_model(
         "TemplatedModel",
         __doc__=DOC_TEMPLATE,
@@ -115,6 +118,7 @@ def with_permissive_schema(x: RawSchemaDef) -> tuple[type[BaseModel], type[BaseM
         **x
     )
 
+    # and create the templated version
     templated=tool_family(FamilyParams)(tool_family_able).with_template(**TEMPLATE_ARGS)
 
     return (permissive_model, tool_family_able, templated)
@@ -152,18 +156,27 @@ def test_tool_family_preserves_validation(data: st.DataObject) -> None:
         f"descriptions not templated: {actual_desc} != {expected_desc}"
 
 
+    # generate a dict representation of a sample from the permissive model
+    # remember, representation (might) have fields outside of the declared bounds
+    # or None (where `basic` is a non-none field)
     payload = data.draw(st.from_type(permissive_model), label="payload").model_dump()
 
     key_universe = sorted(payload)
 
-    # Also exercise missing-field errors, which always-present-keys can't reach:
+    # Also exercise missing-field errors, which always-present-keys can't reach
+    # delete some random keys from the source
     for k in data.draw(st.sets(st.sampled_from(key_universe)), label="dropped keys"):
         del payload[k]
 
+    # now randomly overwriting some fields in the basic model with some arbitrarily chosen values
     for mut in data.draw(st.sets(st.sampled_from(key_universe), max_size=2), label="wrong keys"):
         random_value = data.draw(st.sampled_from([
             3, "hello", False, [3]
         ]))
         payload[mut] = random_value
 
+    # now, check the validation behavior
+    # if payload had legal mutations (deleted no fields, generated all values in range, etc.)
+    # both validations should dump the same representation. Otherwise we should see
+    # a difference in outcomes
     assert validation_outcome(basic, payload) == validation_outcome(templated, payload)
