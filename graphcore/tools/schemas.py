@@ -149,7 +149,10 @@ class TemplatedTool[T: type[BaseModel], **P]:
                 **descr["attributes"],
                 "description": v.description.format(*args, **kwargs)
             }
-            new_fields[k] = (Annotated[v.annotation, *descr["metadata"]], Field(**new_attrs))
+            if descr["metadata"]:
+                new_fields[k] = (Annotated[v.annotation, *descr["metadata"]], Field(**new_attrs))
+            else:
+                new_fields[k] = (v.annotation, Field(**new_attrs))
         return create_model(
             f"{self._staged.__name__}Templated",
             __doc__=new_doc,
