@@ -1,9 +1,14 @@
-from typing import Generic, TypeVar, Annotated, Any, ClassVar, override, Iterator, cast
-
+from typing import (
+    Generic, TypeVar, Annotated, Any, ClassVar, override, Iterator, cast, Mapping, Callable, Never
+)
+import typing
+import string
+import re
+from dataclasses import dataclass
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
 from langchain_core.tools import InjectedToolCallId
 from langgraph.prebuilt import InjectedState
@@ -124,3 +129,75 @@ class WithAsyncDependencies(BaseModel, Generic[T_RES, DEPS]):
 
 class InjectAll(WithInjectedState[ST], WithInjectedId):
     pass
+
+@dataclass
+class TemplatedTool[T: type[BaseModel], **P]:
+    _staged: T
+
+    def with_template(
+        self, *args: P.args, **kwargs: P.kwargs
+    ) -> T:
+        assert self._staged.__doc__ is not None
+        new_doc = self._staged.__doc__.format(*args, **kwargs)
+        assert issubclass(self._staged, BaseModel)
+        new_fields : dict[str, Any] = {}
+        for (k, v) in self._staged.model_fields.items():
+            if not v.description:
+                continue
+            descr = v.asdict()
+            new_attrs = {
+                **descr["attributes"],
+                "description": v.description.format(*args, **kwargs)
+            }
+            if descr["metadata"]:
+                new_fields[k] = (Annotated[v.annotation, *descr["metadata"]], Field(**new_attrs))
+            else:
+                new_fields[k] = (v.annotation, Field(**new_attrs))
+        return create_model(
+            f"{self._staged.__name__}Templated",
+            __doc__=new_doc,
+            __base__=self._staged,
+            **new_fields
+        )
+
+def _placeholders(fmt: str) -> set[str]:
+    to_ret = set()
+    for _, fn, _, _ in string.Formatter().parse(fmt):
+        if not fn:
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", fn) is None:
+            raise ValueError("Cannot define non-simple placeholder")
+        to_ret.add(fn)
+    return to_ret
+
+
+@typing.dataclass_transform(kw_only_default=True)
+class ToolFamilyParams:
+    def __new__(cls) -> Never:
+        raise ValueError("These are phantom types and never meant to be instantiated")
+
+def tool_family[T:
+    WithAsyncDependencies | WithAsyncImplementation | WithImplementation,
+    M: ToolFamilyParams,
+    **P,
+](
+    m: Callable[P, M],
+) -> Callable[[type[T]], TemplatedTool[type[T], P]]:
+    def wrapper(t: type[T]):
+        assert isinstance(m, type)
+        assert issubclass(m, ToolFamilyParams) and issubclass(t, BaseModel)
+        doc = t.__doc__
+        assert doc is not None
+        params = set()
+        params |= _placeholders(doc)
+        for (k, v) in t.model_fields.items():
+            if not v.description:
+                continue
+            params |= _placeholders(v.description)
+        annots = typing.get_type_hints(m)
+        if not (params <= annots.keys()):
+            missing = params - annots.keys()
+            if missing:
+                raise ValueError(f"Missing declared tool params: {missing}")
+        return TemplatedTool(t)
+    return wrapper
