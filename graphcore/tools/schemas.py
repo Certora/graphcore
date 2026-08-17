@@ -1,12 +1,16 @@
 from typing import (
-    Generic, TypeVar, Annotated, Any, ClassVar, override, Iterator, cast, Mapping, Callable, Never
+    Generic, TypeVar, Annotated, Any, ClassVar,
+    override, Iterator, cast, Callable, Never, get_args, get_origin
 )
+import types
 import typing
 import string
 import re
 from dataclasses import dataclass
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import reduce
+from operator import or_
 
 from pydantic import BaseModel, Field, create_model
 
@@ -130,35 +134,11 @@ class WithAsyncDependencies(BaseModel, Generic[T_RES, DEPS]):
 class InjectAll(WithInjectedState[ST], WithInjectedId):
     pass
 
-@dataclass
-class TemplatedTool[T: type[BaseModel], **P]:
-    _staged: T
 
-    def with_template(
-        self, *args: P.args, **kwargs: P.kwargs
-    ) -> T:
-        assert self._staged.__doc__ is not None
-        new_doc = self._staged.__doc__.format(*args, **kwargs)
-        assert issubclass(self._staged, BaseModel)
-        new_fields : dict[str, Any] = {}
-        for (k, v) in self._staged.model_fields.items():
-            if not v.description:
-                continue
-            descr = v.asdict()
-            new_attrs = {
-                **descr["attributes"],
-                "description": v.description.format(*args, **kwargs)
-            }
-            if descr["metadata"]:
-                new_fields[k] = (Annotated[v.annotation, *descr["metadata"]], Field(**new_attrs))
-            else:
-                new_fields[k] = (v.annotation, Field(**new_attrs))
-        return create_model(
-            f"{self._staged.__name__}Templated",
-            __doc__=new_doc,
-            __base__=self._staged,
-            **new_fields
-        )
+@typing.dataclass_transform(kw_only_default=True)
+class ToolFamilyParams:
+    def __new__(cls) -> Never:
+        raise ValueError("These are phantom types and never meant to be instantiated")
 
 def _placeholders(fmt: str) -> set[str]:
     to_ret = set()
@@ -171,18 +151,88 @@ def _placeholders(fmt: str) -> set[str]:
     return to_ret
 
 
-@typing.dataclass_transform(kw_only_default=True)
-class ToolFamilyParams:
-    def __new__(cls) -> Never:
-        raise ValueError("These are phantom types and never meant to be instantiated")
+def map_type[T, U](t: Any, to_rewrite: type[T], f: Callable[[type[T]], type[U]]) -> Any:
+    """Rebuild type expression `t`, replacing occurrences of `to_rewrite` with f(match)."""
+    # A match rewrites and stops -- we don't descend into the matched type.
+    if isinstance(t, type) and issubclass(t, to_rewrite):
+        return f(t)
 
-def tool_family[T:
-    WithAsyncDependencies | WithAsyncImplementation | WithImplementation,
+    origin = get_origin(t)
+    if origin is None:
+        return t  # leaf: plain class, None, Ellipsis, a Literal value, ...
+
+    # Annotated[X, meta...]: walk X, leave metadata alone.
+    if origin is Annotated:
+        inner, *meta = get_args(t)
+        return Annotated[tuple([map_type(inner, to_rewrite, f), *meta])]
+
+    args = get_args(t)
+    new_args = tuple(
+        [map_type(x, to_rewrite, f) for x in a] if isinstance(a, list)  # Callable's [params]
+        else map_type(a, to_rewrite, f)
+        for a in args
+    )
+    if new_args == args:
+        return t  # untouched subtree: hand back the original object
+
+    if origin is types.UnionType:  # X | Y can't be rebuilt as origin[args]
+        return reduce(or_, new_args)
+
+    return origin[new_args]
+
+class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
+    _wrapped: ClassVar[type[BaseModel]]
+    _key_type: ClassVar[type[ToolFamilyParams]]
+
+    @classmethod
+    def with_template(cls, *args: P.args, **kwargs: P.kwargs) -> T:
+        assert cls._wrapped.__doc__ is not None
+        new_doc = cls._wrapped.__doc__.format(*args, **kwargs)
+        assert issubclass(cls._wrapped, BaseModel)
+        new_fields : dict[str, Any] = {}
+        def type_mapper(
+            t: type[_TemplatedTool]
+        ) -> type[Any]:
+            return t.with_template(*args, **kwargs)
+        for (k, v) in cls._wrapped.model_fields.items():
+            actual_type = v.annotation
+            if v.annotation is not None:
+                actual_type = map_type(v.annotation, _TemplatedTool, type_mapper)
+            descr = v.asdict()
+            new_attrs = {
+                **descr["attributes"],
+            }
+            if v.description:
+                new_attrs["description"] = v.description.format(*args, **kwargs)
+            if descr["metadata"]:
+                new_fields[k] = (Annotated[actual_type, *descr["metadata"]], Field(**new_attrs))
+            else:
+                new_fields[k] = (actual_type, Field(**new_attrs))
+        return create_model(
+            cls._wrapped.__name__,
+            __doc__=new_doc,
+            __base__=cast(T, cls._wrapped),
+            **new_fields
+        )
+
+    @staticmethod
+    def _for_type[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type["_TemplatedTool[type[X], K, R]"]:
+        clone = create_model(
+            f"{t.__name__}Template",
+            __base__=(_TemplatedTool,)
+        )
+        clone._wrapped = t
+        clone._key_type = m
+
+        return clone
+
+def tool_family[
+    T: BaseModel,
     M: ToolFamilyParams,
     **P,
 ](
     m: Callable[P, M],
-) -> Callable[[type[T]], TemplatedTool[type[T], P]]:
+) -> Callable[[type[T]], type[_TemplatedTool[type[T], M, P]]]:
     def wrapper(t: type[T]):
         assert isinstance(m, type)
         assert issubclass(m, ToolFamilyParams) and issubclass(t, BaseModel)
@@ -190,7 +240,15 @@ def tool_family[T:
         assert doc is not None
         params = set()
         params |= _placeholders(doc)
+        def check_key(nested: type[_TemplatedTool]) -> type[_TemplatedTool]:
+            if nested._key_type is not m:
+                raise ValueError(
+                    f"Cannot use inconsistent key types: {m} vs {nested._key_type} (via {nested.__name__})"
+                )
+            return nested
         for (k, v) in t.model_fields.items():
+            if v.annotation is not None:
+                map_type(v.annotation, _TemplatedTool, check_key)
             if not v.description:
                 continue
             params |= _placeholders(v.description)
@@ -199,5 +257,5 @@ def tool_family[T:
             missing = params - annots.keys()
             if missing:
                 raise ValueError(f"Missing declared tool params: {missing}")
-        return TemplatedTool(t)
+        return _TemplatedTool._for_type(t, cast(type[M], m))
     return wrapper

@@ -1,5 +1,8 @@
+# pyright: reportInvalidTypeForm=false
+import pytest
+
 from pydantic import BaseModel, Field, create_model, ValidationError
-from typing import Annotated, cast, Any, TypedDict
+from typing import Annotated, cast, Any, TypedDict, get_args, get_origin
 
 from annotated_types import Gt, Ge, Le, Lt
 
@@ -180,3 +183,130 @@ def test_tool_family_preserves_validation(data: st.DataObject) -> None:
     # both validations should dump the same representation. Otherwise we should see
     # a difference in outcomes
     assert validation_outcome(basic, payload) == validation_outcome(templated, payload)
+
+
+# ---------------------------------------------------------------------------
+# Transitive templating: fields whose annotations mention another tool family
+# are templated with the same arguments as the enclosing family.
+# ---------------------------------------------------------------------------
+
+class RecipeParams(ToolFamilyParams):
+    dish: str
+
+
+class Ingredient(BaseModel):
+    """An ingredient of the {dish}"""
+    name: str = Field(description="Name of the ingredient in the {dish}")
+    amount: int = Field(description="How much of it to use")
+
+
+IngredientFamily = tool_family(RecipeParams)(Ingredient)
+
+
+class MakeRecipe(WithImplementation):
+    """Write a recipe for the {dish}"""
+    title: str = Field(description="Title of the {dish} recipe")
+    main: IngredientFamily = Field(description="The main ingredient") #type: ignore[invalidTypeForm]
+    extras: list[IngredientFamily] = Field(description="Additional ingredients")
+    garnish: IngredientFamily | None = Field(default=None, description="Optional garnish")
+
+
+RecipeFamily = tool_family(RecipeParams)(MakeRecipe)
+
+
+def test_transitive_template_direct_field():
+    recipe = RecipeFamily.with_template(dish="paella")
+
+    assert recipe.__name__ == "MakeRecipe"
+    assert recipe.__doc__ == "Write a recipe for the paella"
+    assert recipe.model_fields["title"].annotation is str
+    assert recipe.model_fields["title"].description == "Title of the paella recipe"
+
+    main_ty = recipe.model_fields["main"].annotation
+    assert isinstance(main_ty, type) and issubclass(main_ty, Ingredient)
+    assert main_ty.__doc__ == "An ingredient of the paella"
+    assert main_ty.model_fields["name"].description == "Name of the ingredient in the paella"
+
+
+def test_transitive_template_inside_containers():
+    recipe = RecipeFamily.with_template(dish="soup")
+
+    extras_ty = recipe.model_fields["extras"].annotation
+    assert get_origin(extras_ty) is list
+    (elem_ty,) = get_args(extras_ty)
+    assert issubclass(elem_ty, Ingredient)
+    assert elem_ty.__doc__ == "An ingredient of the soup"
+
+    garnish_ty = recipe.model_fields["garnish"].annotation
+    garnish_args = get_args(garnish_ty)
+    assert type(None) in garnish_args
+    (inner_ty,) = [a for a in garnish_args if a is not type(None)]
+    assert issubclass(inner_ty, Ingredient)
+    assert inner_ty.__doc__ == "An ingredient of the soup"
+
+
+def test_transitive_template_validation():
+    recipe = RecipeFamily.with_template(dish="stew")
+
+    parsed = recipe.model_validate({
+        "title": "Beef stew",
+        "main": {"name": "beef", "amount": 2},
+        "extras": [{"name": "carrot", "amount": 3}],
+        "garnish": None,
+    })
+    assert parsed.main.amount == 2
+    assert parsed.extras[0].name == "carrot"
+
+    with pytest.raises(ValidationError):
+        recipe.model_validate({
+            "title": "Beef stew",
+            "main": {"name": "beef"},  # missing amount
+            "extras": [],
+            "garnish": None,
+        })
+
+
+def test_templated_instances_are_independent():
+    soup = RecipeFamily.with_template(dish="soup")
+    pie = RecipeFamily.with_template(dish="pie")
+
+    soup_main = soup.model_fields["main"].annotation
+    pie_main = pie.model_fields["main"].annotation
+    assert soup_main is not pie_main
+    assert soup_main.__doc__ == "An ingredient of the soup"
+    assert pie_main.__doc__ == "An ingredient of the pie"
+
+
+def test_transitive_template_without_field_description():
+    class Pantry(WithImplementation):
+        """Check the pantry for the {dish}"""
+        staple: IngredientFamily
+
+    pantry = tool_family(RecipeParams)(Pantry).with_template(dish="curry")
+
+    staple_ty = pantry.model_fields["staple"].annotation
+    assert isinstance(staple_ty, type) and issubclass(staple_ty, Ingredient)
+    assert staple_ty.__doc__ == "An ingredient of the curry"
+
+
+def test_inconsistent_key_types_rejected():
+    class GardenParams(ToolFamilyParams):
+        dish: str
+
+    with pytest.raises(ValueError, match="inconsistent key types"):
+        @tool_family(GardenParams)
+        class BadRecipe(WithImplementation):
+            """Write a recipe for the {dish}"""
+            main: IngredientFamily = Field(description="The main ingredient")
+
+    with pytest.raises(ValueError, match="inconsistent key types"):
+        @tool_family(GardenParams)
+        class BadRecipeNested(WithImplementation):
+            """Write a recipe for the {dish}"""
+            extras: list[IngredientFamily] = Field(description="Additional ingredients")
+
+    with pytest.raises(ValueError, match="inconsistent key types"):
+        @tool_family(GardenParams)
+        class BadRecipeUndescribed(WithImplementation):
+            """Write a recipe for the {dish}"""
+            staple: IngredientFamily
