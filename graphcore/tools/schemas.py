@@ -24,6 +24,13 @@ T_RES = TypeVar("T_RES", bound=BareResult | list[BareResult] | Command)
 class WithInjectedState(BaseModel, Generic[ST]):
     state: Annotated[ST, InjectedState]
 
+    def __class_getitem__(cls, params: Any) -> Any:
+        concrete = super().__class_getitem__(params)
+        # Specialized generic models do not inherit the origin's docstring.
+        if isinstance(concrete, type) and not concrete.__doc__:
+            concrete.__doc__ = cls.__doc__
+        return concrete
+
 class WithInjectedId(BaseModel):
     tool_call_id: Annotated[str, InjectedToolCallId]
 
