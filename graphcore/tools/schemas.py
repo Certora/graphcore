@@ -233,6 +233,68 @@ class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
 
         return clone
 
+    @staticmethod
+    def _for_param_type[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]):
+        clone = create_model(
+            t.__name__,
+            __base__=(t, _TemplatedTool),
+            __doc__=t.__doc__
+        )
+
+        clone_narrowed = cast(type[_TemplatedTool[type[X], K, R]], clone)
+        clone_narrowed._wrapped = t
+        clone_narrowed._key_type = m
+
+        return cast(type[X], clone_narrowed)
+
+def _map_templated_type[
+    T: BaseModel,
+    M: ToolFamilyParams,
+    **P,
+    R,
+](
+    m: Callable[P, M],
+    t: type[T],
+    f: Callable[[type[T], type[M]], R]
+) -> R:
+    assert isinstance(m, type)
+    assert issubclass(m, ToolFamilyParams) and issubclass(t, BaseModel)
+    doc = t.__doc__
+    assert doc is not None
+    params = set()
+    params |= _placeholders(doc)
+    def check_key(nested: type[_TemplatedTool]) -> type[_TemplatedTool]:
+        if nested._key_type is not m:
+            raise ValueError(
+                f"Cannot use inconsistent key types: {m} vs {nested._key_type} (via {nested.__name__})"
+            )
+        return nested
+    for (k, v) in t.model_fields.items():
+        if v.annotation is not None:
+            map_type(v.annotation, _TemplatedTool, check_key)
+        if not v.description:
+            continue
+        params |= _placeholders(v.description)
+    annots = typing.get_type_hints(m)
+    if not (params <= annots.keys()):
+        missing = params - annots.keys()
+        if missing:
+            raise ValueError(f"Missing declared tool params: {missing}")
+    return f(t, cast(type[M], m))
+
+
+
+def family_param[
+    T: BaseModel,
+    M: ToolFamilyParams,
+    **P,
+](
+    m: Callable[P, M]
+) -> Callable[[type[T]], type[T]]:
+    def wrapper(t: type[T]):
+        return _map_templated_type(m, t, _TemplatedTool._for_param_type)
+    return wrapper
+
 def tool_family[
     T: BaseModel,
     M: ToolFamilyParams,
@@ -241,28 +303,5 @@ def tool_family[
     m: Callable[P, M],
 ) -> Callable[[type[T]], type[_TemplatedTool[type[T], M, P]]]:
     def wrapper(t: type[T]):
-        assert isinstance(m, type)
-        assert issubclass(m, ToolFamilyParams) and issubclass(t, BaseModel)
-        doc = t.__doc__
-        assert doc is not None
-        params = set()
-        params |= _placeholders(doc)
-        def check_key(nested: type[_TemplatedTool]) -> type[_TemplatedTool]:
-            if nested._key_type is not m:
-                raise ValueError(
-                    f"Cannot use inconsistent key types: {m} vs {nested._key_type} (via {nested.__name__})"
-                )
-            return nested
-        for (k, v) in t.model_fields.items():
-            if v.annotation is not None:
-                map_type(v.annotation, _TemplatedTool, check_key)
-            if not v.description:
-                continue
-            params |= _placeholders(v.description)
-        annots = typing.get_type_hints(m)
-        if not (params <= annots.keys()):
-            missing = params - annots.keys()
-            if missing:
-                raise ValueError(f"Missing declared tool params: {missing}")
-        return _TemplatedTool._for_type(t, cast(type[M], m))
+        return cast(type[_TemplatedTool[type[T], M, P]], _map_templated_type(m, t, _TemplatedTool._for_type))
     return wrapper
