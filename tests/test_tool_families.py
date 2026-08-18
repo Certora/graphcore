@@ -8,7 +8,9 @@ from annotated_types import Gt, Ge, Le, Lt
 
 from hypothesis import HealthCheck, given, settings, strategies as st, Phase
 
-from graphcore.tools.schemas import WithImplementation, ToolFamilyParams, tool_family
+from graphcore.tools.schemas import (
+    WithImplementation, WithInjectedState, ToolFamilyParams, tool_family,
+)
 
 class TemplateArgValues(TypedDict):
     verb: str
@@ -310,3 +312,15 @@ def test_inconsistent_key_types_rejected():
         class BadRecipeUndescribed(WithImplementation):
             """Write a recipe for the {dish}"""
             staple: IngredientFamily
+
+
+def test_injected_state_subscription_copies_doc():
+    class Slice(TypedDict):
+        n: int
+
+    class Tool[T](WithInjectedState[T]):
+        """the description"""
+
+    concrete = Tool[Slice]
+    assert concrete.__doc__ == "the description"
+    assert concrete.model_fields["state"].annotation is Slice
