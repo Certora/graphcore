@@ -50,6 +50,7 @@ class WithImplementation(BaseModel, Generic[T_RES]):
     ) -> BaseTool:
         impl_method = getattr(cls, "run")
         
+        # Simple wrapper - just accept kwargs, instantiate model, call method
         def wrapper(**kwargs: Any) -> Any:
             instance = cls(**kwargs)
             return impl_method(instance)
@@ -73,6 +74,7 @@ class WithAsyncImplementation(BaseModel, Generic[T_RES]):
     ) -> BaseTool:
         impl_method = getattr(cls, "run")
         
+        # Simple wrapper - just accept kwargs, instantiate model, call method
         async def wrapper(**kwargs: Any) -> Any:
             instance = cls(**kwargs)
             d = await impl_method(instance)
@@ -97,6 +99,7 @@ class ToolBuilder:
     def as_tool(self, name: str) -> BaseTool:
         impl_method = self._ty.run
         
+        # Simple wrapper - just accept kwargs, instantiate model, call method
         async def wrapper(**kwargs: Any) -> Any:
             instance = self._ty(**kwargs)
             tok = self._ty._dep_ctx.set(self.deps)
