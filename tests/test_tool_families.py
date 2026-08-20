@@ -371,6 +371,7 @@ def test_a_rendered_value_survives_a_checkpoint_round_trip():
     raw = rendered.model_validate({"portion": {"grams": 50}}).portion
     assert type(raw) is not Portion
     cmd = tool_state_update("t1", "ok", portions=[raw])
+    assert cmd.update is not None
     assert type(cmd.update["portions"][0]) is Portion
     assert type(rebind_family_param_values(raw)) is Portion
 
