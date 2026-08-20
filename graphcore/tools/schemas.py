@@ -188,8 +188,28 @@ def map_type[T, U](t: Any, to_rewrite: type[T], f: Callable[[type[T]], type[U]])
     return origin[new_args]
 
 class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
+    """A schema whose prose carries `{placeholder}`s, paired with the params that name them.
+
+    :meth:`with_template` renders it into the schema an LLM is actually shown. What the two
+    variants below decide is that rendered class's identity: what it derives from, and where it
+    claims to live."""
+
     _wrapped: ClassVar[type[BaseModel]]
     _key_type: ClassVar[type[ToolFamilyParams]]
+
+    @classmethod
+    def _render_onto(cls) -> type[BaseModel]:
+        """The base a rendered schema derives from."""
+        raise NotImplementedError
+
+    @classmethod
+    def _rendered_module(cls) -> str:
+        """The module a rendered schema claims.
+
+        A serialized value names its class by module and class name, and is restored by importing
+        the one and looking the other up in it, so this decides what a rendered value comes back
+        as -- or whether it comes back as a value at all."""
+        raise NotImplementedError
 
     @classmethod
     def with_template(cls, *args: P.args, **kwargs: P.kwargs) -> T:
@@ -218,30 +238,72 @@ class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
         return create_model(
             cls._wrapped.__name__,
             __doc__=new_doc,
-            __base__=cast(T, cls._wrapped),
+            __base__=cast(T, cls._render_onto()),
+            __module__=cls._rendered_module(),
             **new_fields
         )
 
+
+class _ToolFamily[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[T, M, P]):
+    """The handle :func:`tool_family` binds: a stand-in for the family, not a schema of its own.
+
+    It is never a value's type, so a rendering is just the wrapped schema."""
+
+    @override
+    @classmethod
+    def _render_onto(cls) -> type[BaseModel]:
+        return cls._wrapped
+
+    @override
+    @classmethod
+    def _rendered_module(cls) -> str:
+        # Stays where it is built, which no name resolves to: `t`'s own name in `t`'s module is
+        # this handle, and a rendering that claimed to be that would restore with no fields at all.
+        return __name__
+
     @staticmethod
-    def _for_type[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type["_TemplatedTool[type[X], K, R]"]:
+    def of[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type["_ToolFamily[type[X], K, R]"]:
         clone = create_model(
             f"{t.__name__}Template",
-            __base__=(_TemplatedTool,)
+            __base__=(_ToolFamily,),
+            __module__=t.__module__
         )
         clone._wrapped = t
         clone._key_type = m
 
         return clone
 
+
+class _FamilyParam[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[T, M, P]):
+    """The class :func:`family_param` binds: a subclass of the wrapped schema, so it is a usable
+    annotation, and a rendering of it is a subclass of *this*.
+
+    So a value a templated tool builds is an instance of the name the decorator bound, and
+    restoring one recovers that name -- the rendering itself is not importable, being built at
+    runtime, and this is the class it renders onto."""
+
+    @override
+    @classmethod
+    def _render_onto(cls) -> type[BaseModel]:
+        return cls
+
+    @override
+    @classmethod
+    def _rendered_module(cls) -> str:
+        return cls.__module__
+
     @staticmethod
-    def _for_param_type[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]):
+    def of[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type[X]:
         clone = create_model(
             t.__name__,
-            __base__=(t, _TemplatedTool),
-            __doc__=t.__doc__
+            __base__=(t, _FamilyParam),
+            __doc__=t.__doc__,
+            # The decorator binds this class to `t`'s name in `t`'s module, so that is where it
+            # lives; create_model would otherwise have it claim this one.
+            __module__=t.__module__
         )
 
-        clone_narrowed = cast(type[_TemplatedTool[type[X], K, R]], clone)
+        clone_narrowed = cast(type[_FamilyParam[type[X], K, R]], clone)
         clone_narrowed._wrapped = t
         clone_narrowed._key_type = m
 
@@ -292,7 +354,7 @@ def family_param[
     m: Callable[P, M]
 ) -> Callable[[type[T]], type[T]]:
     def wrapper(t: type[T]):
-        return _map_templated_type(m, t, _TemplatedTool._for_param_type)
+        return _map_templated_type(m, t, _FamilyParam.of)
     return wrapper
 
 def tool_family[
@@ -303,5 +365,5 @@ def tool_family[
     m: Callable[P, M],
 ) -> Callable[[type[T]], type[_TemplatedTool[type[T], M, P]]]:
     def wrapper(t: type[T]):
-        return cast(type[_TemplatedTool[type[T], M, P]], _map_templated_type(m, t, _TemplatedTool._for_type))
+        return cast(type[_TemplatedTool[type[T], M, P]], _map_templated_type(m, t, _ToolFamily.of))
     return wrapper
