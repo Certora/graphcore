@@ -38,6 +38,39 @@ class WithInjectedState(BaseModel, Generic[ST]):
 class WithInjectedId(BaseModel):
     tool_call_id: Annotated[str, InjectedToolCallId]
 
+def rebind_family_param_values(value: Any) -> Any:
+    """Replace rendered family-param instances with the class the decorator bound.
+
+    A rendering is a runtime subclass used as the LLM schema. LangGraph restores a
+    model by importing its class, which only the bound name admits."""
+    if isinstance(value, list):
+        return [rebind_family_param_values(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(rebind_family_param_values(v) for v in value)
+    if isinstance(value, dict):
+        return {k: rebind_family_param_values(v) for k, v in value.items()}
+    bound = getattr(type(value), "_bound", None)
+    if (
+        isinstance(value, BaseModel)
+        and isinstance(bound, type)
+        and type(value) is not bound
+        and issubclass(type(value), bound)
+    ):
+        return bound.model_validate(value.model_dump())
+    return value
+
+
+def _tool_instance(cls: type[BaseModel], kwargs: dict[str, Any]) -> Any:
+    instance = cls(**kwargs)
+    for name, field in type(instance).model_fields.items():
+        if InjectedState in field.metadata:
+            continue
+        object.__setattr__(
+            instance, name, rebind_family_param_values(getattr(instance, name))
+        )
+    return instance
+
+
 class WithImplementation(BaseModel, Generic[T_RES]):
     def run(self) -> T_RES:
         """Override this method to implement the tool logic."""
@@ -50,10 +83,8 @@ class WithImplementation(BaseModel, Generic[T_RES]):
     ) -> BaseTool:
         impl_method = getattr(cls, "run")
         
-        # Simple wrapper - just accept kwargs, instantiate model, call method
         def wrapper(**kwargs: Any) -> Any:
-            instance = cls(**kwargs)
-            return impl_method(instance)
+            return impl_method(_tool_instance(cls, kwargs))
         
         return StructuredTool.from_function(
             func=wrapper,
@@ -74,11 +105,8 @@ class WithAsyncImplementation(BaseModel, Generic[T_RES]):
     ) -> BaseTool:
         impl_method = getattr(cls, "run")
         
-        # Simple wrapper - just accept kwargs, instantiate model, call method
         async def wrapper(**kwargs: Any) -> Any:
-            instance = cls(**kwargs)
-            d = await impl_method(instance)
-            return d
+            return await impl_method(_tool_instance(cls, kwargs))
         
         return StructuredTool.from_function(
             coroutine=wrapper,
@@ -99,9 +127,8 @@ class ToolBuilder:
     def as_tool(self, name: str) -> BaseTool:
         impl_method = self._ty.run
         
-        # Simple wrapper - just accept kwargs, instantiate model, call method
         async def wrapper(**kwargs: Any) -> Any:
-            instance = self._ty(**kwargs)
+            instance = _tool_instance(self._ty, kwargs)
             tok = self._ty._dep_ctx.set(self.deps)
             try:
                 d = await impl_method(instance)
@@ -190,9 +217,8 @@ def map_type[T, U](t: Any, to_rewrite: type[T], f: Callable[[type[T]], type[U]])
 class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
     """A schema whose prose carries `{placeholder}`s, paired with the params that name them.
 
-    :meth:`with_template` renders it into the schema an LLM is actually shown. What the two
-    variants below decide is that rendered class's identity: what it derives from, and where it
-    claims to live."""
+    :meth:`with_template` renders it into the schema an LLM is actually shown. The two variants
+    below differ only in what that rendered class derives from."""
 
     _wrapped: ClassVar[type[BaseModel]]
     _key_type: ClassVar[type[ToolFamilyParams]]
@@ -200,15 +226,6 @@ class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
     @classmethod
     def _render_onto(cls) -> type[BaseModel]:
         """The base a rendered schema derives from."""
-        raise NotImplementedError
-
-    @classmethod
-    def _rendered_module(cls) -> str:
-        """The module a rendered schema claims.
-
-        A serialized value names its class by module and class name, and is restored by importing
-        the one and looking the other up in it, so this decides what a rendered value comes back
-        as -- or whether it comes back as a value at all."""
         raise NotImplementedError
 
     @classmethod
@@ -239,7 +256,6 @@ class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
             cls._wrapped.__name__,
             __doc__=new_doc,
             __base__=cast(T, cls._render_onto()),
-            __module__=cls._rendered_module(),
             **new_fields
         )
 
@@ -253,13 +269,6 @@ class _ToolFamily[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[T
     @classmethod
     def _render_onto(cls) -> type[BaseModel]:
         return cls._wrapped
-
-    @override
-    @classmethod
-    def _rendered_module(cls) -> str:
-        # Stays where it is built, which no name resolves to: `t`'s own name in `t`'s module is
-        # this handle, and a rendering that claimed to be that would restore with no fields at all.
-        return __name__
 
     @staticmethod
     def of[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type["_ToolFamily[type[X], K, R]"]:
@@ -278,19 +287,16 @@ class _FamilyParam[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[
     """The class :func:`family_param` binds: a subclass of the wrapped schema, so it is a usable
     annotation, and a rendering of it is a subclass of *this*.
 
-    So a value a templated tool builds is an instance of the name the decorator bound, and
-    restoring one recovers that name -- the rendering itself is not importable, being built at
-    runtime, and this is the class it renders onto."""
+    Values written through :meth:`WithImplementation.as_tool` / :func:`rebind_family_param_values`
+    are this class, not the rendering. LangGraph restores a model by importing its class, which
+    only this (module-level) name admits."""
+
+    _bound: ClassVar[type[BaseModel]]
 
     @override
     @classmethod
     def _render_onto(cls) -> type[BaseModel]:
         return cls
-
-    @override
-    @classmethod
-    def _rendered_module(cls) -> str:
-        return cls.__module__
 
     @staticmethod
     def of[X: BaseModel, K: ToolFamilyParams,  **R](t: type[X], m: type[K]) -> type[X]:
@@ -306,6 +312,7 @@ class _FamilyParam[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[
         clone_narrowed = cast(type[_FamilyParam[type[X], K, R]], clone)
         clone_narrowed._wrapped = t
         clone_narrowed._key_type = m
+        clone_narrowed._bound = clone_narrowed
 
         return cast(type[X], clone_narrowed)
 
