@@ -12,10 +12,8 @@ from hypothesis import HealthCheck, given, settings, strategies as st, Phase
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from graphcore.graph import tool_state_update
 from graphcore.tools.schemas import (
     WithImplementation, WithInjectedState, ToolFamilyParams, family_param, tool_family,
-    rebind_family_param_values,
 )
 
 class TemplateArgValues(TypedDict):
@@ -327,6 +325,7 @@ def test_family_param_renders_a_subtype_of_the_bound_name():
     assert portion_ty.model_fields["grams"].description == "How many grams of the risotto to serve"
     assert issubclass(portion_ty, Portion)
     assert portion_ty.__name__ == "Portion"
+    assert portion_ty.__module__ == Portion.__module__
 
 
 def test_family_param_value_validates_against_the_bound_name():
@@ -345,10 +344,16 @@ def test_family_param_lives_where_the_decorator_bound_it():
     module = importlib.import_module(Portion.__module__)
     assert getattr(module, Portion.__name__) is Portion
 
+    rendered = Portion.with_template(dish="curry")  # type: ignore[attributeAccessIssue]
+    assert rendered.__module__ == Portion.__module__
+    assert rendered.__name__ == Portion.__name__
+    # The rendering claims that location; lookup still returns the bound class.
+    assert getattr(module, rendered.__name__) is Portion
+
 
 def test_a_rendered_value_survives_a_checkpoint_round_trip():
-    # JsonPlus names a model by module and class; a rendering is importable under no name.
-    # as_tool / tool_state_update rebind values to the bound class before they hit state.
+    # JsonPlus names a model by module and class. A rendering claims the bound
+    # class's location, so restore constructs that class, not a dict.
     class Plate(WithImplementation):
         """Plate the {dish}"""
         portion: Portion = Field(description="The portion of {dish} to plate")
@@ -357,7 +362,8 @@ def test_a_rendered_value_survives_a_checkpoint_round_trip():
 
     tool = tool_family(RecipeParams)(Plate).with_template(dish="risotto").as_tool("plate")
     plated = tool.invoke({"portion": {"grams": 200}})
-    assert type(plated) is Portion
+    assert isinstance(plated, Portion)
+    assert type(plated) is not Portion
 
     serde = JsonPlusSerializer()
     (restored,) = serde.loads_typed(serde.dumps_typed([plated]))
@@ -370,10 +376,9 @@ def test_a_rendered_value_survives_a_checkpoint_round_trip():
     rendered = tool_family(RecipeParams)(ServeDish).with_template(dish="stew")
     raw = rendered.model_validate({"portion": {"grams": 50}}).portion
     assert type(raw) is not Portion
-    cmd = tool_state_update("t1", "ok", portions=[raw])
-    assert cmd.update is not None
-    assert type(cmd.update["portions"][0]) is Portion
-    assert type(rebind_family_param_values(raw)) is Portion
+    (restored_raw,) = serde.loads_typed(serde.dumps_typed([raw]))
+    assert type(restored_raw) is Portion
+    assert restored_raw.grams == 50
 
 
 def test_family_param_renderings_stay_independent():
@@ -395,7 +400,9 @@ def test_family_param_is_directly_renderable():
 
     assert issubclass(portion, Portion)
     assert portion.__doc__ == "A portion of the curry"
-    assert type(rebind_family_param_values(portion(grams=3))) is Portion
+    serde = JsonPlusSerializer()
+    restored = serde.loads_typed(serde.dumps_typed(portion(grams=3)))
+    assert type(restored) is Portion
 
 
 def test_inconsistent_key_types_rejected():

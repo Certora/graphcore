@@ -38,7 +38,6 @@ from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
 from .utils import ainvoke, invoke, current_prompt_tokens, get_token_usage
 from .summary import SummaryConfig, Summarization
-from .tools.schemas import rebind_family_param_values
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +81,7 @@ def tool_output(tool_call_id: str, res: dict) -> Command:
         Command that updates state with final results and a success message
     """
     return Command(update={
-        **rebind_family_param_values(res),
+        **res,
         "messages": [ToolMessage(
             tool_call_id=tool_call_id,
             content="Success"
@@ -124,7 +123,7 @@ def tool_state_update(
         "messages": [
             ToolMessage(tool_call_id=tool_call_id, content=content)
         ],
-        **rebind_family_param_values(state_diff)
+        **state_diff
     }
     return Command(update=update)
 

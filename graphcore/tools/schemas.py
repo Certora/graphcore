@@ -38,39 +38,6 @@ class WithInjectedState(BaseModel, Generic[ST]):
 class WithInjectedId(BaseModel):
     tool_call_id: Annotated[str, InjectedToolCallId]
 
-def rebind_family_param_values(value: Any) -> Any:
-    """Replace rendered family-param instances with the class the decorator bound.
-
-    A rendering is a runtime subclass used as the LLM schema. LangGraph restores a
-    model by importing its class, which only the bound name admits."""
-    if isinstance(value, list):
-        return [rebind_family_param_values(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(rebind_family_param_values(v) for v in value)
-    if isinstance(value, dict):
-        return {k: rebind_family_param_values(v) for k, v in value.items()}
-    bound = getattr(type(value), "_bound", None)
-    if (
-        isinstance(value, BaseModel)
-        and isinstance(bound, type)
-        and type(value) is not bound
-        and issubclass(type(value), bound)
-    ):
-        return bound.model_validate(value.model_dump())
-    return value
-
-
-def _tool_instance(cls: type[BaseModel], kwargs: dict[str, Any]) -> Any:
-    instance = cls(**kwargs)
-    for name, field in type(instance).model_fields.items():
-        if InjectedState in field.metadata:
-            continue
-        object.__setattr__(
-            instance, name, rebind_family_param_values(getattr(instance, name))
-        )
-    return instance
-
-
 class WithImplementation(BaseModel, Generic[T_RES]):
     def run(self) -> T_RES:
         """Override this method to implement the tool logic."""
@@ -84,7 +51,8 @@ class WithImplementation(BaseModel, Generic[T_RES]):
         impl_method = getattr(cls, "run")
         
         def wrapper(**kwargs: Any) -> Any:
-            return impl_method(_tool_instance(cls, kwargs))
+            instance = cls(**kwargs)
+            return impl_method(instance)
         
         return StructuredTool.from_function(
             func=wrapper,
@@ -106,7 +74,9 @@ class WithAsyncImplementation(BaseModel, Generic[T_RES]):
         impl_method = getattr(cls, "run")
         
         async def wrapper(**kwargs: Any) -> Any:
-            return await impl_method(_tool_instance(cls, kwargs))
+            instance = cls(**kwargs)
+            d = await impl_method(instance)
+            return d
         
         return StructuredTool.from_function(
             coroutine=wrapper,
@@ -128,7 +98,7 @@ class ToolBuilder:
         impl_method = self._ty.run
         
         async def wrapper(**kwargs: Any) -> Any:
-            instance = _tool_instance(self._ty, kwargs)
+            instance = self._ty(**kwargs)
             tok = self._ty._dep_ctx.set(self.deps)
             try:
                 d = await impl_method(instance)
@@ -252,10 +222,14 @@ class _TemplatedTool[T: type[BaseModel], M: ToolFamilyParams, **P](BaseModel):
                 new_fields[k] = (Annotated[actual_type, *descr["metadata"]], Field(**new_attrs))
             else:
                 new_fields[k] = (actual_type, Field(**new_attrs))
+        onto = cls._render_onto()
         return create_model(
             cls._wrapped.__name__,
             __doc__=new_doc,
-            __base__=cast(T, cls._render_onto()),
+            __base__=cast(T, onto),
+            # JsonPlus restores by importing module+name; create_model would
+            # otherwise claim this file, which no such name admits.
+            __module__=onto.__module__,
             **new_fields
         )
 
@@ -287,11 +261,8 @@ class _FamilyParam[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[
     """The class :func:`family_param` binds: a subclass of the wrapped schema, so it is a usable
     annotation, and a rendering of it is a subclass of *this*.
 
-    Values written through :meth:`WithImplementation.as_tool` / :func:`rebind_family_param_values`
-    are this class, not the rendering. LangGraph restores a model by importing its class, which
-    only this (module-level) name admits."""
-
-    _bound: ClassVar[type[BaseModel]]
+    A rendering claims this class's ``__module__`` and ``__name__``. LangGraph restores a
+    model by importing its class, which only this (module-level) name admits."""
 
     @override
     @classmethod
@@ -312,7 +283,6 @@ class _FamilyParam[T: type[BaseModel], M: ToolFamilyParams, **P](_TemplatedTool[
         clone_narrowed = cast(type[_FamilyParam[type[X], K, R]], clone)
         clone_narrowed._wrapped = t
         clone_narrowed._key_type = m
-        clone_narrowed._bound = clone_narrowed
 
         return cast(type[X], clone_narrowed)
 
