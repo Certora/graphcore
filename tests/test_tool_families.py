@@ -1,4 +1,6 @@
 # pyright: reportInvalidTypeForm=false
+import importlib
+
 import pytest
 
 from pydantic import BaseModel, Field, create_model, ValidationError
@@ -8,8 +10,10 @@ from annotated_types import Gt, Ge, Le, Lt
 
 from hypothesis import HealthCheck, given, settings, strategies as st, Phase
 
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
 from graphcore.tools.schemas import (
-    WithImplementation, WithInjectedState, ToolFamilyParams, tool_family,
+    WithImplementation, WithInjectedState, ToolFamilyParams, family_param, tool_family,
 )
 
 class TemplateArgValues(TypedDict):
@@ -289,6 +293,116 @@ def test_transitive_template_without_field_description():
     staple_ty = pantry.model_fields["staple"].annotation
     assert isinstance(staple_ty, type) and issubclass(staple_ty, Ingredient)
     assert staple_ty.__doc__ == "An ingredient of the curry"
+
+
+# ---------------------------------------------------------------------------
+# `family_param`: the class the decorator binds is a usable annotation, and it keeps its
+# identity -- a rendered instance is an instance of it, and it lives where it was declared.
+# ---------------------------------------------------------------------------
+
+@family_param(RecipeParams)
+class Portion(BaseModel):
+    """A portion of the {dish}"""
+    grams: int = Field(description="How many grams of the {dish} to serve")
+
+
+class ServeDish(WithImplementation):
+    """Serve the {dish}"""
+    portion: Portion = Field(description="The portion of {dish} to plate")
+
+
+class Meal(BaseModel):
+    """Where a value the tool built is stored afterwards, annotated with the bound name."""
+    portions: list[Portion]
+
+
+def test_family_param_renders_a_subtype_of_the_bound_name():
+    served = tool_family(RecipeParams)(ServeDish).with_template(dish="risotto")
+
+    portion_ty = served.model_fields["portion"].annotation
+    assert isinstance(portion_ty, type)
+    assert portion_ty.__doc__ == "A portion of the risotto"
+    assert portion_ty.model_fields["grams"].description == "How many grams of the risotto to serve"
+    assert issubclass(portion_ty, Portion)
+    assert portion_ty.__name__ == "Portion"
+    assert portion_ty.__module__ == Portion.__module__
+
+
+def test_family_param_value_validates_against_the_bound_name():
+    served = tool_family(RecipeParams)(ServeDish).with_template(dish="stew")
+
+    plated = served.model_validate({"portion": {"grams": 200}})
+    assert isinstance(plated.portion, Portion)
+
+    stored = Meal.model_validate({"portions": [plated.portion]})
+    assert stored.portions[0].grams == 200
+    assert isinstance(stored.portions[0], Portion)
+
+
+def test_family_param_lives_where_the_decorator_bound_it():
+    # What a checkpoint serializer needs: it restores a model by importing its class.
+    module = importlib.import_module(Portion.__module__)
+    assert getattr(module, Portion.__name__) is Portion
+
+    rendered = Portion.with_template(dish="curry")  # type: ignore[attributeAccessIssue]
+    assert rendered.__module__ == Portion.__module__
+    assert rendered.__name__ == Portion.__name__
+    # The rendering claims that location; lookup still returns the bound class.
+    assert getattr(module, rendered.__name__) is Portion
+
+
+def test_a_rendered_value_survives_a_checkpoint_round_trip():
+    # JsonPlus names a model by module and class. A rendering claims the bound
+    # class's location, so restore constructs that class, not a dict.
+    class Plate(WithImplementation):
+        """Plate the {dish}"""
+        portion: Portion = Field(description="The portion of {dish} to plate")
+        def run(self) -> Portion:
+            return self.portion
+
+    tool = tool_family(RecipeParams)(Plate).with_template(dish="risotto").as_tool("plate")
+    plated = tool.invoke({"portion": {"grams": 200}})
+    assert isinstance(plated, Portion)
+    assert type(plated) is not Portion
+
+    serde = JsonPlusSerializer()
+    (restored,) = serde.loads_typed(serde.dumps_typed([plated]))
+    assert type(restored) is Portion, f"restored as {type(restored)}, not the bound class"
+    assert restored.grams == 200
+
+    restored_list = serde.loads_typed(serde.dumps_typed([plated, plated]))
+    assert [type(x) is Portion and x.grams == 200 for x in restored_list] == [True, True]
+
+    rendered = tool_family(RecipeParams)(ServeDish).with_template(dish="stew")
+    raw = rendered.model_validate({"portion": {"grams": 50}}).portion
+    assert type(raw) is not Portion
+    (restored_raw,) = serde.loads_typed(serde.dumps_typed([raw]))
+    assert type(restored_raw) is Portion
+    assert restored_raw.grams == 50
+
+
+def test_family_param_renderings_stay_independent():
+    stew = tool_family(RecipeParams)(ServeDish).with_template(dish="stew")
+    pie = tool_family(RecipeParams)(ServeDish).with_template(dish="pie")
+
+    stew_portion = stew.model_fields["portion"].annotation
+    pie_portion = pie.model_fields["portion"].annotation
+    assert isinstance(stew_portion, type) and isinstance(pie_portion, type)
+    assert stew_portion is not pie_portion
+    assert issubclass(stew_portion, Portion) and issubclass(pie_portion, Portion)
+    assert not issubclass(stew_portion, pie_portion)
+    assert stew_portion.__doc__ == "A portion of the stew"
+    assert pie_portion.__doc__ == "A portion of the pie"
+
+
+def test_family_param_is_directly_renderable():
+    portion = Portion.with_template(dish="curry")  # type: ignore[attributeAccessIssue]
+
+    assert issubclass(portion, Portion)
+    assert portion.__doc__ == "A portion of the curry"
+    serde = JsonPlusSerializer()
+    restored = serde.loads_typed(serde.dumps_typed(portion(grams=3)))
+    assert type(restored) is Portion
 
 
 def test_inconsistent_key_types_rejected():
