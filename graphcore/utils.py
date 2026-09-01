@@ -13,20 +13,15 @@
 #      You should have received a copy of the GNU General Public License
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import TypedDict, Literal, List, Sequence
+import logging
+from typing import TypedDict, List, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, BaseMessage
 from langchain_core.runnables import Runnable
 
+logger = logging.getLogger(__name__)
 
-type TokenUsageKeysT = Literal[
-    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
-]
-
-_token_usage_keys : list[TokenUsageKeysT] = [
-    "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
-]
 
 class TokenUsageDict(TypedDict):
     """Dictionary for accumulating token usage across LLM calls."""
@@ -37,25 +32,36 @@ class TokenUsageDict(TypedDict):
     model_name: str | None
 
 def get_token_usage(m: AIMessage) -> TokenUsageDict:
-    to_ret : TokenUsageDict = {
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "model_name": None
+    """Per-bucket raw counts for one response, read from ``usage_metadata`` — the
+    one field every provider and request surface populates.
+
+    The three input buckets are disjoint, and each bills at its own rate.
+    ``usage_metadata`` reports an inclusive input total, so the cache buckets are
+    subtracted back out to leave the fresh input ``input_tokens`` means here."""
+    normalized = get_normalized_token_usage(m)
+    cache_read = normalized["cache_read_tokens"]
+    cache_write = normalized["cache_write_tokens"]
+
+    # A gateway normalizing usage from an arbitrary upstream can report a bucket
+    # bigger than the total it belongs to. Unclamped that lands as a negative count,
+    # which subtracts from the run's totals and bills below zero instead of failing.
+    fresh_input = normalized["total_input_tokens"] - cache_read - cache_write
+    if fresh_input < 0:
+        logger.warning(
+            "%s reported cache buckets (read %d, write %d) exceeding its %d-token "
+            "input total; counting fresh input as 0.",
+            normalized["model_name"], cache_read, cache_write,
+            normalized["total_input_tokens"],
+        )
+        fresh_input = 0
+
+    return {
+        "input_tokens": fresh_input,
+        "output_tokens": normalized["total_output_tokens"],
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "model_name": normalized["model_name"],
     }
-    rm = m.response_metadata
-    if "model_name" in rm and isinstance(rm['model_name'], str):
-        to_ret["model_name"] = rm['model_name']
-    if "usage" not in rm or not isinstance(rm["usage"], dict):
-        return to_ret
-    usage_meta = m.response_metadata["usage"]
-    for k in _token_usage_keys:
-        tok = usage_meta.get(k, 0)
-        if not isinstance(tok, int):
-            continue # be cool
-        to_ret[k] = to_ret[k] + tok
-    return to_ret
 
 class NormalizedTokenUsage(TypedDict):
     total_input_tokens: int
