@@ -19,13 +19,14 @@ one is invisible until a real toolchain is pointed at the directory:
 import asyncio
 import json
 import pathlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
 import pytest
 
 from graphcore.tools.vfs import (
     MATERIALIZED_MANIFEST,
+    DictBackend,
     DirBackend,
     PersistentMaterializer,
     fs_tools_layered,
@@ -54,27 +55,6 @@ class _CountingBackend:
     async def dump_to(self, target, include_path=None) -> None:
         self.dumps += 1
         await self.inner.dump_to(target, include_path=include_path)
-
-
-@dataclass
-class DictBackend:
-    """An in-memory ``FSBackend``, standing in for an edit overlay."""
-
-    files: dict[str, str] = field(default_factory=dict)
-
-    def get(self, path: str) -> str | None:
-        return self.files.get(path)
-
-    def list(self) -> Iterable[str]:
-        return list(self.files)
-
-    async def dump_to(self, target, include_path=None) -> None:
-        for path, content in self.files.items():
-            if include_path is not None and not include_path(path):
-                continue
-            dest = target / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content)
 
 
 def _project(root: pathlib.Path, **files: str) -> DirBackend:

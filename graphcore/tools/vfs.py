@@ -812,6 +812,38 @@ class _LayeredMaterializer:
         return None
 
 
+@dataclass
+class DictBackend:
+    """``FSBackend`` over an in-memory ``{path: content}`` map — the canonical overlay.
+
+    Mutable on purpose: an overlay's whole job is to change between dumps, and a caller that
+    derives its content from somewhere else (agent state, a checkpoint) reassigns :attr:`files` and
+    materializes again.
+    """
+
+    files: dict[str, str] = field(default_factory=dict)
+
+    def get(self, path: str) -> str | None:
+        return self.files.get(path)
+
+    def list(self) -> Iterable[str]:
+        return list(self.files)
+
+    async def dump_to(
+        self,
+        target: pathlib.Path,
+        include_path: Callable[[str], bool] | None = None,
+    ) -> None:
+        def _write() -> None:
+            for path, content in self.files.items():
+                if include_path is not None and not include_path(path):
+                    continue
+                dest = target / path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
+        await asyncio.to_thread(_write)
+
+
 #: Where :class:`PersistentMaterializer` records what it put in a target directory. Lives in the
 #: target rather than in memory because the point of a persistent target is that it outlives the
 #: process that filled it: a resumed run has to be able to tell its own earlier output apart from
