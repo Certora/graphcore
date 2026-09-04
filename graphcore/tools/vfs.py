@@ -68,10 +68,13 @@ def _floor_exclude(path: str) -> bool:
 type GlobalExcludeArg = str | Callable[[pathlib.PurePath], bool] | None
 
 
-def _make_exclude_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
+def make_exclude_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
     """Normalize either form of :data:`GlobalExcludeArg` to one *exclude*
     predicate over path strings (True = exclude). The single place the two
-    surface forms are interpreted."""
+    surface forms are interpreted, which is why it is exported: a caller that
+    holds a :data:`GlobalExcludeArg` and needs to ask the question itself —
+    rather than hand the argument to a tool suite — reads the two forms the
+    same way the tools do instead of restating the rule."""
     if arg is None:
         return lambda _: False
     if isinstance(arg, str):
@@ -91,7 +94,7 @@ def _make_global_include_pred(arg: GlobalExcludeArg) -> Callable[[str], bool]:
     polarity flip happens here at the boundary so internal predicate
     composition stays consistent.
     """
-    excludes = _make_exclude_pred(arg)
+    excludes = make_exclude_pred(arg)
     return lambda p: not _floor_exclude(p) and not excludes(p)
 
 
@@ -102,7 +105,7 @@ def _make_checker(arg: GlobalExcludeArg) -> Callable[[str], bool]:
     filters narrow the agent's tool surface only, and the floor is applied
     separately alongside them.
     """
-    excludes = _make_exclude_pred(arg)
+    excludes = make_exclude_pred(arg)
     return lambda f_name: not excludes(f_name)
 
 class FileRange(BaseModel):
