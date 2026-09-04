@@ -823,82 +823,80 @@ class PersistentMaterializer:
     """Materializer for a target directory that is **reused** between dumps.
 
     :class:`_LayeredMaterializer` fills a fresh directory: every dump writes every file. That is
-    right for a temp dir, and wrong for a target something else owns state in — which is the case
-    as soon as a build system runs there. Two problems appear, and neither is visible until then:
+    right for a temp dir, and wrong once something else owns state in the target — which is what
+    happens as soon as a build system runs there. Three problems appear, and none is visible with a
+    temp dir:
 
     * **An unchanged file must keep its mtime.** A build system that fingerprints on mtime — cargo
       does — treats a rewritten-but-identical file as changed and rebuilds everything downstream of
       it. Over a dependency graph that is minutes per dump, which is the entire cost a warm
       directory exists to avoid.
     * **Nothing this materializer did not write may be disturbed.** A persistent build directory
-      accumulates things that are not view content: compiler output, a package cache, lock files.
-      They have to survive a dump untouched, so the materializer must know what *it* put there.
+      accumulates compiler output, a package cache, lock files. They have to survive a dump
+      untouched, so the materializer has to know what *it* put there.
+    * **Re-reading an unchanging layer is waste.** A project checkout is the bulk of the view and
+      none of the churn; comparing all of it on every dump is the copy this class exists to avoid,
+      moved rather than removed.
 
-    Both follow from writing through a manifest: compare before writing, and delete only paths this
-    materializer wrote earlier that the view no longer serves.
+    Hence two roles rather than one flat stack. ``base`` is the unchanging bulk — copied once into
+    a fresh target, by the backend's own ``dump_to``, and never read again. ``overlays`` are the
+    layers that move, in priority order above the base; they are content-compared on every dump.
 
-    **Binary files are materialized once.** The first dump into an empty target delegates to each
-    backend's own ``dump_to``, which copies bytes and so carries images, archives and fixtures.
-    Incremental dumps afterwards go through ``get``, which is text-only — so a file no layer can
-    serve as text is written once and never rewritten. Nothing is lost by that: an edit layer's
-    content is ``str``, so no edit can change a binary file in the first place.
+    That split also settles what happens to a path an overlay *stops* serving, which a flat stack
+    cannot answer: if the base still serves it the file is **restored** from the base, and only if
+    nothing serves it is it removed. An overlay that modified a project file leaves the project's
+    own version behind; an overlay that invented a file takes it away with it. Both are what an
+    undo should mean.
+
+    **Binary content is carried by the base.** Overlays are consulted through ``get``, which is
+    text-only, so a file no overlay serves as text is written once by the base copy and never
+    rewritten. Nothing is lost: an overlay's content is ``str``, so it could not have changed a
+    binary file anyway.
     """
 
     def __init__(
         self,
-        backends: Sequence[FSBackend],
+        base: FSBackend,
+        overlays: Sequence[FSBackend] = (),
         global_exclude: GlobalExcludeArg = None,
     ) -> None:
-        self._backends = list(backends)
+        self._base = base
+        self._overlays = list(overlays)
         self._include: Callable[[str], bool] = _make_global_include_pred(global_exclude)
 
     async def dump_to(self, target: pathlib.Path) -> None:
         manifest = target / MATERIALIZED_MANIFEST
-        written = self._read_manifest(manifest)
-        if written is None:
-            # First dump into this target: let the backends copy themselves in, which is both
-            # faster than file-by-file and the only path that carries non-text content.
-            for backend in reversed(self._backends):
-                await backend.dump_to(target, include_path=self._include)
-            written = set()
+        previous = self._read_manifest(manifest)
+        if previous is None:
+            await self._base.dump_to(target, include_path=self._include)
+            previous = set()
 
-        serves: set[str] = set()
+        current: dict[str, str] = {}
+        for overlay in reversed(self._overlays):
+            for path in overlay.list():
+                if not self._include(path):
+                    continue
+                content = overlay.get(path)
+                if content is not None:
+                    current[path] = content
 
         def _sync() -> None:
-            for path in self._paths():
-                content = self._read(path)
-                if content is None:
-                    continue
-                serves.add(path)
+            for path, content in current.items():
                 _write_if_changed(target / path, content)
-            # Only ever what a previous dump of *this* materializer wrote. A file the target
-            # accumulated by other means is not ours to remove.
-            for stale in written - serves:
-                (target / stale).unlink(missing_ok=True)
+            for path in previous - current.keys():
+                restored = self._base.get(path)
+                if restored is None:
+                    (target / path).unlink(missing_ok=True)
+                else:
+                    _write_if_changed(target / path, restored)
 
         await asyncio.to_thread(_sync)
-        self._write_manifest(manifest, serves)
+        self._write_manifest(manifest, set(current))
 
     def get(self, path: str) -> str | None:
         if not self._include(path):
             return None
-        for backend in self._backends:
-            content = backend.get(path)
-            if content is not None:
-                return content
-        return None
-
-    def _paths(self) -> Iterator[str]:
-        seen: set[str] = set()
-        for backend in self._backends:
-            for path in backend.list():
-                if path in seen or not self._include(path):
-                    continue
-                seen.add(path)
-                yield path
-
-    def _read(self, path: str) -> str | None:
-        for backend in self._backends:
+        for backend in (*self._overlays, self._base):
             content = backend.get(path)
             if content is not None:
                 return content
@@ -906,26 +904,27 @@ class PersistentMaterializer:
 
     @staticmethod
     def _read_manifest(manifest: pathlib.Path) -> set[str] | None:
-        """What an earlier dump wrote, or ``None`` if this target has never been dumped into.
+        """What the last dump's overlays served, or ``None`` if this target has never been dumped
+        into.
 
-        ``None`` and the empty set are different answers and the difference decides whether the
-        bulk copy runs: a target with a manifest naming nothing is one a previous dump emptied,
-        while a target with no manifest has never been filled. A manifest that will not parse is
-        treated as absent, which costs one redundant bulk copy and never loses a file.
+        ``None`` and the empty set are different answers and the difference decides whether the base
+        copy runs: a target whose last dump had no overlay content still has the base in it, while a
+        target with no manifest has nothing. A manifest that will not parse is read as absent, which
+        costs one redundant base copy and never loses a file.
         """
         try:
             loaded = json.loads(manifest.read_text())
         except (OSError, ValueError):
             return None
-        paths = loaded.get("written")
+        paths = loaded.get("overlaid")
         if not isinstance(paths, list):
             return None
         return {p for p in paths if isinstance(p, str)}
 
     @staticmethod
-    def _write_manifest(manifest: pathlib.Path, written: set[str]) -> None:
+    def _write_manifest(manifest: pathlib.Path, overlaid: set[str]) -> None:
         manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(json.dumps({"written": sorted(written)}, indent=2))
+        manifest.write_text(json.dumps({"overlaid": sorted(overlaid)}, indent=2))
 
 
 def _write_if_changed(path: pathlib.Path, content: str) -> None:
@@ -963,8 +962,15 @@ def _default_materializer(
 def persistent_materializer(
     backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
 ) -> Materializer:
-    """:data:`MaterializerFactory` for a reused target — pass to ``fs_tools_layered``."""
-    return PersistentMaterializer(backends, global_exclude=global_exclude)
+    """:data:`MaterializerFactory` for a reused target — pass to ``fs_tools_layered``.
+
+    Reads the stack the way :class:`PersistentMaterializer` splits it: the **last** backend is the
+    base (the unchanging bulk, which in a read stack is the lowest-priority layer), and everything
+    above it is an overlay. A single-backend stack is all base and no overlay, which dumps once and
+    then does nothing — correct, and a sign the caller wanted the default materializer.
+    """
+    *overlays, base = backends
+    return PersistentMaterializer(base, overlays, global_exclude=global_exclude)
 
 
 def fs_tools_layered(

@@ -9,7 +9,11 @@ one is invisible until a real toolchain is pointed at the directory:
   everything downstream of a rewritten-but-identical file;
 * content the dump did not put there survives it, because a warm build directory accumulates
   compiler output and package caches that are not view content;
-* a path the view stops serving is removed, because a stale file left behind still compiles.
+* a path an overlay stops serving is restored from the base if the base has one and removed if
+  not, because a stale file left behind still compiles and a deleted project file breaks a build
+  that was fine before anyone edited anything;
+* the base is read once however many dumps follow, because re-comparing a checkout that never
+  changes is the copy this class exists to avoid, moved rather than removed.
 """
 
 import asyncio
@@ -29,6 +33,27 @@ from graphcore.tools.vfs import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@dataclass
+class _CountingBackend:
+    """Wraps a backend and counts what the materializer asks of it."""
+
+    inner: DirBackend
+    reads: int = 0
+    dumps: int = 0
+
+    def get(self, path: str) -> str | None:
+        self.reads += 1
+        return self.inner.get(path)
+
+    def list(self) -> Iterable[str]:
+        self.reads += 1
+        return self.inner.list()
+
+    async def dump_to(self, target, include_path=None) -> None:
+        self.dumps += 1
+        await self.inner.dump_to(target, include_path=include_path)
 
 
 @dataclass
@@ -64,10 +89,10 @@ async def test_the_first_dump_fills_an_empty_target(tmp_path):
     base = _project(tmp_path / "src", lib__rs="fn main() {}")
     target = tmp_path / "out"
 
-    await PersistentMaterializer([base]).dump_to(target)
+    await PersistentMaterializer(base).dump_to(target)
 
     assert (target / "lib/rs").read_text() == "fn main() {}"
-    assert json.loads((target / MATERIALIZED_MANIFEST).read_text())["written"] == ["lib/rs"]
+    assert json.loads((target / MATERIALIZED_MANIFEST).read_text())["overlaid"] == []
 
 
 async def test_an_unchanged_file_is_not_rewritten(tmp_path):
@@ -79,7 +104,7 @@ async def test_an_unchanged_file_is_not_rewritten(tmp_path):
     """
     base = _project(tmp_path / "src", a__rs="const A: u8 = 1;")
     target = tmp_path / "out"
-    mat = PersistentMaterializer([base])
+    mat = PersistentMaterializer(base)
     await mat.dump_to(target)
     before = (target / "a/rs").stat().st_mtime_ns
 
@@ -92,7 +117,7 @@ async def test_a_changed_file_is_rewritten(tmp_path):
     base = _project(tmp_path / "src", a__rs="const A: u8 = 1;")
     edits = DictBackend()
     target = tmp_path / "out"
-    mat = PersistentMaterializer([edits, base])
+    mat = PersistentMaterializer(base, [edits])
     await mat.dump_to(target)
 
     edits.files["a/rs"] = "const A: u8 = 2;"
@@ -107,7 +132,7 @@ async def test_content_the_dump_did_not_write_survives(tmp_path):
     was for."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
-    mat = PersistentMaterializer([base])
+    mat = PersistentMaterializer(base)
     await mat.dump_to(target)
 
     artifact = target / "target" / "debug" / "a.rlib"
@@ -123,13 +148,13 @@ async def test_content_the_dump_did_not_write_survives(tmp_path):
     assert cache.read_text() == "fetched"
 
 
-async def test_a_path_the_view_stops_serving_is_removed(tmp_path):
+async def test_an_overlay_that_invented_a_file_takes_it_away(tmp_path):
     """A reverted edit that left its file behind would keep compiling — the stale copy is still on
-    disk and still valid Rust. Removal is what makes an edit undoable in a reused target."""
+    disk and still valid Rust. Nothing else serves this path, so undo means removal."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     edits = DictBackend({"b/rs": "fn b() {}"})
     target = tmp_path / "out"
-    mat = PersistentMaterializer([edits, base])
+    mat = PersistentMaterializer(base, [edits])
     await mat.dump_to(target)
     assert (target / "b/rs").exists()
 
@@ -140,12 +165,47 @@ async def test_a_path_the_view_stops_serving_is_removed(tmp_path):
     assert (target / "a/rs").exists()
 
 
+async def test_an_overlay_that_modified_a_file_restores_the_base(tmp_path):
+    """The other half of undo, and the one a flat stack cannot express. A file the project ships
+    and an overlay rewrote must come *back*, not vanish — deleting it would break a build that was
+    fine before anyone edited anything."""
+    base = _project(tmp_path / "src", a__rs="pristine")
+    edits = DictBackend({"a/rs": "munged"})
+    target = tmp_path / "out"
+    mat = PersistentMaterializer(base, [edits])
+    await mat.dump_to(target)
+    assert (target / "a/rs").read_text() == "munged"
+
+    del edits.files["a/rs"]
+    await mat.dump_to(target)
+
+    assert (target / "a/rs").read_text() == "pristine"
+
+
+async def test_the_base_is_read_once_however_many_dumps_follow(tmp_path):
+    """The third reason this class exists: a project checkout is the bulk of the view and none of
+    the churn, so comparing all of it on every dump is the copy the class avoids, moved rather than
+    removed."""
+    base = _CountingBackend(_project(tmp_path / "src", a__rs="fn a() {}"))
+    edits = DictBackend({"b/rs": "fn b() {}"})
+    target = tmp_path / "out"
+    mat = PersistentMaterializer(base, [edits])
+
+    await mat.dump_to(target)
+    after_first = base.reads
+    edits.files["b/rs"] = "fn b() { todo!() }"
+    await mat.dump_to(target)
+
+    assert base.dumps == 1
+    assert base.reads == after_first, "the base was re-read on a later dump"
+
+
 async def test_removal_is_limited_to_what_this_materializer_wrote(tmp_path):
     """The manifest is the boundary. A file that merely *looks* like view content — same name, put
     there by something else — is not this materializer's to delete."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
-    mat = PersistentMaterializer([base])
+    mat = PersistentMaterializer(base)
     await mat.dump_to(target)
 
     intruder = target / "not_ours.rs"
@@ -161,14 +221,14 @@ async def test_a_corrupt_manifest_costs_a_bulk_copy_and_loses_nothing(tmp_path):
     binary content."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
-    mat = PersistentMaterializer([base])
+    mat = PersistentMaterializer(base)
     await mat.dump_to(target)
     (target / MATERIALIZED_MANIFEST).write_text("{not json")
 
     await mat.dump_to(target)
 
     assert (target / "a/rs").read_text() == "fn a() {}"
-    assert json.loads((target / MATERIALIZED_MANIFEST).read_text())["written"] == ["a/rs"]
+    assert json.loads((target / MATERIALIZED_MANIFEST).read_text())["overlaid"] == []
 
 
 async def test_binary_content_survives_the_first_dump(tmp_path):
@@ -181,7 +241,7 @@ async def test_binary_content_survives_the_first_dump(tmp_path):
     (src / "a.rs").write_text("fn a() {}")
     target = tmp_path / "out"
 
-    mat = PersistentMaterializer([DirBackend(src, cache_listing=False)])
+    mat = PersistentMaterializer(DirBackend(src, cache_listing=False))
     await mat.dump_to(target)
     await mat.dump_to(target)
 
@@ -193,7 +253,7 @@ async def test_layer_priority_holds_at_materialization(tmp_path):
     edits = DictBackend({"a/rs": "edited"})
     target = tmp_path / "out"
 
-    await PersistentMaterializer([edits, base]).dump_to(target)
+    await PersistentMaterializer(base, [edits]).dump_to(target)
 
     assert (target / "a/rs").read_text() == "edited"
 
@@ -202,7 +262,7 @@ async def test_globally_excluded_paths_are_never_written(tmp_path):
     base = _project(tmp_path / "src", a__rs="keep", secret__rs="drop")
     target = tmp_path / "out"
 
-    await PersistentMaterializer([base], global_exclude=r"secret/.*").dump_to(target)
+    await PersistentMaterializer(base, global_exclude=r"secret/.*").dump_to(target)
 
     assert (target / "a/rs").exists()
     assert not (target / "secret/rs").exists()
@@ -218,6 +278,7 @@ async def test_the_factory_wires_it_through_fs_tools_layered(tmp_path):
     tools, mat = fs_tools_layered([edits, base], materializer=persistent_materializer)
     await mat.dump_to(target)
 
+    # The factory splits the read stack the way the class wants it: lowest priority is the base.
     assert isinstance(mat, PersistentMaterializer)
     get_file = next(t for t in tools if t.name == "get_file")
     # What the agent reads and what the build compiles are the same text.
@@ -231,7 +292,7 @@ async def test_concurrent_readers_never_see_a_partial_file(tmp_path):
     base = _project(tmp_path / "src", a__rs="x" * 100_000)
     edits = DictBackend()
     target = tmp_path / "out"
-    mat = PersistentMaterializer([edits, base])
+    mat = PersistentMaterializer(base, [edits])
     await mat.dump_to(target)
 
     seen: list[int] = []
