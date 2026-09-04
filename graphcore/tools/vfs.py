@@ -16,6 +16,8 @@
 from typing_extensions import TypedDict
 from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Iterable, Sequence, ContextManager, Protocol, Iterator, Generic
 import asyncio
+import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -810,10 +812,166 @@ class _LayeredMaterializer:
         return None
 
 
+#: Where :class:`PersistentMaterializer` records what it put in a target directory. Lives in the
+#: target rather than in memory because the point of a persistent target is that it outlives the
+#: process that filled it: a resumed run has to be able to tell its own earlier output apart from
+#: whatever else the directory has accumulated.
+MATERIALIZED_MANIFEST = ".graphcore-materialized.json"
+
+
+class PersistentMaterializer:
+    """Materializer for a target directory that is **reused** between dumps.
+
+    :class:`_LayeredMaterializer` fills a fresh directory: every dump writes every file. That is
+    right for a temp dir, and wrong for a target something else owns state in — which is the case
+    as soon as a build system runs there. Two problems appear, and neither is visible until then:
+
+    * **An unchanged file must keep its mtime.** A build system that fingerprints on mtime — cargo
+      does — treats a rewritten-but-identical file as changed and rebuilds everything downstream of
+      it. Over a dependency graph that is minutes per dump, which is the entire cost a warm
+      directory exists to avoid.
+    * **Nothing this materializer did not write may be disturbed.** A persistent build directory
+      accumulates things that are not view content: compiler output, a package cache, lock files.
+      They have to survive a dump untouched, so the materializer must know what *it* put there.
+
+    Both follow from writing through a manifest: compare before writing, and delete only paths this
+    materializer wrote earlier that the view no longer serves.
+
+    **Binary files are materialized once.** The first dump into an empty target delegates to each
+    backend's own ``dump_to``, which copies bytes and so carries images, archives and fixtures.
+    Incremental dumps afterwards go through ``get``, which is text-only — so a file no layer can
+    serve as text is written once and never rewritten. Nothing is lost by that: an edit layer's
+    content is ``str``, so no edit can change a binary file in the first place.
+    """
+
+    def __init__(
+        self,
+        backends: Sequence[FSBackend],
+        global_exclude: GlobalExcludeArg = None,
+    ) -> None:
+        self._backends = list(backends)
+        self._include: Callable[[str], bool] = _make_global_include_pred(global_exclude)
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        manifest = target / MATERIALIZED_MANIFEST
+        written = self._read_manifest(manifest)
+        if written is None:
+            # First dump into this target: let the backends copy themselves in, which is both
+            # faster than file-by-file and the only path that carries non-text content.
+            for backend in reversed(self._backends):
+                await backend.dump_to(target, include_path=self._include)
+            written = set()
+
+        serves: set[str] = set()
+
+        def _sync() -> None:
+            for path in self._paths():
+                content = self._read(path)
+                if content is None:
+                    continue
+                serves.add(path)
+                _write_if_changed(target / path, content)
+            # Only ever what a previous dump of *this* materializer wrote. A file the target
+            # accumulated by other means is not ours to remove.
+            for stale in written - serves:
+                (target / stale).unlink(missing_ok=True)
+
+        await asyncio.to_thread(_sync)
+        self._write_manifest(manifest, serves)
+
+    def get(self, path: str) -> str | None:
+        if not self._include(path):
+            return None
+        for backend in self._backends:
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
+
+    def _paths(self) -> Iterator[str]:
+        seen: set[str] = set()
+        for backend in self._backends:
+            for path in backend.list():
+                if path in seen or not self._include(path):
+                    continue
+                seen.add(path)
+                yield path
+
+    def _read(self, path: str) -> str | None:
+        for backend in self._backends:
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
+
+    @staticmethod
+    def _read_manifest(manifest: pathlib.Path) -> set[str] | None:
+        """What an earlier dump wrote, or ``None`` if this target has never been dumped into.
+
+        ``None`` and the empty set are different answers and the difference decides whether the
+        bulk copy runs: a target with a manifest naming nothing is one a previous dump emptied,
+        while a target with no manifest has never been filled. A manifest that will not parse is
+        treated as absent, which costs one redundant bulk copy and never loses a file.
+        """
+        try:
+            loaded = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            return None
+        paths = loaded.get("written")
+        if not isinstance(paths, list):
+            return None
+        return {p for p in paths if isinstance(p, str)}
+
+    @staticmethod
+    def _write_manifest(manifest: pathlib.Path, written: set[str]) -> None:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({"written": sorted(written)}, indent=2))
+
+
+def _write_if_changed(path: pathlib.Path, content: str) -> None:
+    """Write ``content`` to ``path`` only if it differs from what is already there.
+
+    The comparison is the whole point — see :class:`PersistentMaterializer`. The write itself is
+    atomic (write-then-replace) so a reader that catches the directory mid-dump sees either the old
+    file or the new one, never a truncated one; a build running concurrently with a dump is exactly
+    the situation a persistent target invites.
+    """
+    try:
+        if path.read_text() == content:
+            return
+    except (OSError, ValueError):
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(content)
+    os.replace(tmp, path)
+
+
+#: How :func:`fs_tools_layered` builds the materializer it returns. A factory rather than a flag so
+#: that a caller selects a *strategy by name* — :class:`_LayeredMaterializer` for a fresh target,
+#: :class:`PersistentMaterializer` for one that is reused — and so a caller with a third can pass it
+#: without this signature growing another boolean.
+type MaterializerFactory = Callable[[Sequence[FSBackend], GlobalExcludeArg], Materializer]
+
+
+def _default_materializer(
+    backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
+) -> Materializer:
+    return _LayeredMaterializer(backends, global_exclude=global_exclude)
+
+
+def persistent_materializer(
+    backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
+) -> Materializer:
+    """:data:`MaterializerFactory` for a reused target — pass to ``fs_tools_layered``."""
+    return PersistentMaterializer(backends, global_exclude=global_exclude)
+
+
 def fs_tools_layered(
     backends: Sequence[FSBackend],
     forbidden_read: GlobalExcludeArg = None,
     global_exclude: GlobalExcludeArg = None,
+    materializer: MaterializerFactory = _default_materializer,
 ) -> tuple[list[BaseTool], Materializer]:
     """Create stateless read-only filesystem tools over a layered backend stack.
 
@@ -836,6 +994,16 @@ def fs_tools_layered(
     ``[get_file, list_files, grep_files]``; ``materializer`` dumps the
     composite view into a caller-provided directory, honoring layer
     priority and the global exclude.
+
+    ``materializer`` selects the dump strategy. The default fills a fresh
+    directory. Pass :func:`persistent_materializer` for a target that is
+    reused between dumps — a warm build directory, say — where rewriting
+    an unchanged file costs a rebuild and where content the dump did not
+    put there has to survive it.
+
+    Both halves come out of one call over one backend stack on purpose:
+    the read tools and the materializer must not be able to disagree
+    about what the composite view contains.
     """
     # Single fold: tool-surface readability is "forbidden_read allows
     # AND not globally excluded". One predicate = no foot-gun about
@@ -921,7 +1089,7 @@ def fs_tools_layered(
         )
 
     tools: list[BaseTool] = [get_file, list_files, grep_files]
-    return tools, _LayeredMaterializer(backend_list, global_exclude=global_exclude)
+    return tools, materializer(backend_list, global_exclude)
 
 
 def fs_tools(
