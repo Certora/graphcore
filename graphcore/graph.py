@@ -348,7 +348,48 @@ def _get_summarizer_pure(
             return {}
     return to_return
 
+class NoToolCallsError(RuntimeError):
+    """The model kept ending its turn without a tool call, past the point of scolding it.
+
+    The scolding node exists because a turn with no tool call cannot advance the graph:
+    it tells the model to call one and routes back for another try. A model that answers
+    every scolding the same way turns that into a cycle whose only exit is langgraph's
+    recursion limit, hundreds of paid calls later. One scolding is enough for a model that
+    is going to recover, so past ``MAX_CONSECUTIVE_NO_TOOL_TURNS`` we stop and say so.
+    """
+
+
+#: Consecutive no-tool-call AI turns tolerated before :class:`NoToolCallsError`.
+MAX_CONSECUTIVE_NO_TOOL_TURNS = 3
+
+
+def _consecutive_no_tool_turns(messages: Iterable[AnyMessage]) -> int:
+    """Count the AI turns at the tail that ended without a tool call.
+
+    Only the scoldings this node inserts may sit between them; anything else means the
+    run advanced in between, so the count starts over.
+    """
+    count = 0
+    for m in reversed(list(messages)):
+        if isinstance(m, AIMessage):
+            if m.tool_calls:
+                break
+            count += 1
+        elif isinstance(m, HumanMessage) and getattr(m, "display_tag", None) == "scolding":
+            continue
+        else:
+            break
+    return count
+
+
 def _scolding_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
+    turns = _consecutive_no_tool_turns(state["messages"])
+    if turns >= MAX_CONSECUTIVE_NO_TOOL_TURNS:
+        raise NoToolCallsError(
+            f"The model ended {turns} consecutive turns without a tool call, after being "
+            "told each time that every turn must end with one. Giving up rather than "
+            "cycling to the recursion limit."
+        )
     return {"messages": [HumanMessage(
         content="Every AI turn must end with at least one tool call. Double check your "
                 "initial prompt for what tools you should be using. In particular, if you "
