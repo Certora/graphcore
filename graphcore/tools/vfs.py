@@ -889,11 +889,13 @@ class PersistentMaterializer:
             for path, content in current.items():
                 _write_if_changed(target / path, content)
             for path in previous - current.keys():
+                dest = target / path
                 restored = self._base.get(path)
                 if restored is None:
-                    (target / path).unlink(missing_ok=True)
+                    dest.unlink(missing_ok=True)
+                    _clear_scratch(dest)
                 else:
-                    _write_if_changed(target / path, restored)
+                    _write_if_changed(dest, restored)
 
         await asyncio.to_thread(_sync)
         self._write_manifest(manifest, set(current))
@@ -919,6 +921,8 @@ class PersistentMaterializer:
             loaded = json.loads(manifest.read_text())
         except (OSError, ValueError):
             return None
+        if not isinstance(loaded, dict):
+            return None
         paths = loaded.get("overlaid")
         if not isinstance(paths, list):
             return None
@@ -926,25 +930,51 @@ class PersistentMaterializer:
 
     @staticmethod
     def _write_manifest(manifest: pathlib.Path, overlaid: set[str]) -> None:
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(json.dumps({"overlaid": sorted(overlaid)}, indent=2))
+        _atomic_write(manifest, json.dumps({"overlaid": sorted(overlaid)}, indent=2))
+
+
+def _scratch_prefix(path: pathlib.Path) -> str:
+    return f"{path.name}.tmp-"
+
+
+def _clear_scratch(path: pathlib.Path) -> None:
+    """Remove leftover ``{name}.tmp-*`` next to ``path`` (a killed dump, a new pid)."""
+    parent = path.parent
+    prefix = _scratch_prefix(path)
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if child.name.startswith(prefix):
+            child.unlink(missing_ok=True)
+
+
+def _atomic_write(path: pathlib.Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _clear_scratch(path)
+    tmp = path.with_name(f"{_scratch_prefix(path)}{os.getpid()}")
+    try:
+        tmp.write_text(content)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _write_if_changed(path: pathlib.Path, content: str) -> None:
     """Skip the write when bytes match, so mtime is unchanged.
 
     Atomic (tmp + ``os.replace``) so a concurrent reader sees either the
-    old file or the new one, never a truncated one.
+    old file or the new one. Scratch from a killed dump is removed even
+    when the file itself does not need rewriting.
     """
+    _clear_scratch(path)
     try:
         if path.read_text() == content:
             return
     except (OSError, ValueError):
         pass
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(content)
-    os.replace(tmp, path)
+    _atomic_write(path, content)
 
 
 #: How :func:`fs_tools_layered` constructs its materializer.

@@ -163,18 +163,34 @@ async def test_removal_is_limited_to_what_this_materializer_wrote(tmp_path):
     assert intruder.read_text() == "someone else's"
 
 
-async def test_a_corrupt_manifest_costs_a_bulk_copy_and_loses_nothing(tmp_path):
+@pytest.mark.parametrize("junk", ["{not json", "[]", "null", "1", '"x"'])
+async def test_a_corrupt_manifest_costs_a_bulk_copy_and_loses_nothing(tmp_path, junk):
     """Unreadable is absent, not empty: empty would skip the base copy."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
     mat = PersistentMaterializer(base)
     await mat.dump_to(target)
-    (target / MATERIALIZED_MANIFEST).write_text("{not json")
+    (target / MATERIALIZED_MANIFEST).write_text(junk)
 
     await mat.dump_to(target)
 
     assert (target / "a/rs").read_text() == "fn a() {}"
     assert json.loads((target / MATERIALIZED_MANIFEST).read_text())["overlaid"] == []
+
+
+async def test_a_leftover_scratch_file_is_removed(tmp_path):
+    """A killed dump can leave ``{name}.tmp-{pid}``; a later process must not leave it in src/."""
+    base = _project(tmp_path / "src", a__rs="fn a() {}")
+    edits = DictBackend({"a/rs": "edited"})
+    target = tmp_path / "out"
+    mat = PersistentMaterializer(base, [edits])
+    await mat.dump_to(target)
+    scratch = (target / "a/rs").with_name("rs.tmp-99999")
+    scratch.write_text("partial")
+
+    await mat.dump_to(target)
+
+    assert [p.name for p in (target / "a").iterdir()] == ["rs"]
 
 
 async def test_binary_content_survives_the_first_dump(tmp_path):
