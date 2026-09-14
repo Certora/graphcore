@@ -814,12 +814,7 @@ class _LayeredMaterializer:
 
 @dataclass
 class DictBackend:
-    """``FSBackend`` over an in-memory ``{path: content}`` map — the canonical overlay.
-
-    Mutable on purpose: an overlay's whole job is to change between dumps, and a caller that
-    derives its content from somewhere else (agent state, a checkpoint) reassigns :attr:`files` and
-    materializes again.
-    """
+    """In-memory ``FSBackend``. Callers mutate :attr:`files` between dumps."""
 
     files: dict[str, str] = field(default_factory=dict)
 
@@ -844,46 +839,24 @@ class DictBackend:
         await asyncio.to_thread(_write)
 
 
-#: Where :class:`PersistentMaterializer` records what it put in a target directory. Lives in the
-#: target rather than in memory because the point of a persistent target is that it outlives the
-#: process that filled it: a resumed run has to be able to tell its own earlier output apart from
-#: whatever else the directory has accumulated.
+#: Overlay paths last written into a target. Stored in the target so a later
+#: process can tell that output apart from whatever else the directory holds.
 MATERIALIZED_MANIFEST = ".graphcore-materialized.json"
 
 
 class PersistentMaterializer:
-    """Materializer for a target directory that is **reused** between dumps.
+    """Writes a composite view into a directory that is reused between dumps.
 
-    :class:`_LayeredMaterializer` fills a fresh directory: every dump writes every file. That is
-    right for a temp dir, and wrong once something else owns state in the target — which is what
-    happens as soon as a build system runs there. Three problems appear, and none is visible with a
-    temp dir:
+    A reused target already holds other state — compiler output, a package
+    cache — so a dump must not disturb files it did not write, and must not
+    rewrite an unchanged file (mtime is a fingerprint).
 
-    * **An unchanged file must keep its mtime.** A build system that fingerprints on mtime — cargo
-      does — treats a rewritten-but-identical file as changed and rebuilds everything downstream of
-      it. Over a dependency graph that is minutes per dump, which is the entire cost a warm
-      directory exists to avoid.
-    * **Nothing this materializer did not write may be disturbed.** A persistent build directory
-      accumulates compiler output, a package cache, lock files. They have to survive a dump
-      untouched, so the materializer has to know what *it* put there.
-    * **Re-reading an unchanging layer is waste.** A project checkout is the bulk of the view and
-      none of the churn; comparing all of it on every dump is the copy this class exists to avoid,
-      moved rather than removed.
-
-    Hence two roles rather than one flat stack. ``base`` is the unchanging bulk — copied once into
-    a fresh target, by the backend's own ``dump_to``, and never read again. ``overlays`` are the
-    layers that move, in priority order above the base; they are content-compared on every dump.
-
-    That split also settles what happens to a path an overlay *stops* serving, which a flat stack
-    cannot answer: if the base still serves it the file is **restored** from the base, and only if
-    nothing serves it is it removed. An overlay that modified a project file leaves the project's
-    own version behind; an overlay that invented a file takes it away with it. Both are what an
-    undo should mean.
-
-    **Binary content is carried by the base.** Overlays are consulted through ``get``, which is
-    text-only, so a file no overlay serves as text is written once by the base copy and never
-    rewritten. Nothing is lost: an overlay's content is ``str``, so it could not have changed a
-    binary file anyway.
+    ``base`` is the unchanging bulk, copied once. ``overlays`` are
+    content-compared on every dump; a path an overlay drops is restored from
+    the base if ``base.get`` returns text, and unlinked otherwise. Binary
+    files ride the first copy; they cannot be restored (``get`` is
+    text-only), so an overlay that overwrote a binary path unlinks it on
+    drop.
     """
 
     def __init__(
@@ -936,13 +909,11 @@ class PersistentMaterializer:
 
     @staticmethod
     def _read_manifest(manifest: pathlib.Path) -> set[str] | None:
-        """What the last dump's overlays served, or ``None`` if this target has never been dumped
-        into.
+        """Overlay paths from the last dump, or ``None`` if this target has never been dumped.
 
-        ``None`` and the empty set are different answers and the difference decides whether the base
-        copy runs: a target whose last dump had no overlay content still has the base in it, while a
-        target with no manifest has nothing. A manifest that will not parse is read as absent, which
-        costs one redundant base copy and never loses a file.
+        ``None`` and the empty set are different: empty means the base is
+        already in the target; ``None`` means copy it. An unreadable manifest
+        is treated as absent.
         """
         try:
             loaded = json.loads(manifest.read_text())
@@ -960,12 +931,10 @@ class PersistentMaterializer:
 
 
 def _write_if_changed(path: pathlib.Path, content: str) -> None:
-    """Write ``content`` to ``path`` only if it differs from what is already there.
+    """Skip the write when bytes match, so mtime is unchanged.
 
-    The comparison is the whole point — see :class:`PersistentMaterializer`. The write itself is
-    atomic (write-then-replace) so a reader that catches the directory mid-dump sees either the old
-    file or the new one, never a truncated one; a build running concurrently with a dump is exactly
-    the situation a persistent target invites.
+    Atomic (tmp + ``os.replace``) so a concurrent reader sees either the
+    old file or the new one, never a truncated one.
     """
     try:
         if path.read_text() == content:
@@ -978,10 +947,7 @@ def _write_if_changed(path: pathlib.Path, content: str) -> None:
     os.replace(tmp, path)
 
 
-#: How :func:`fs_tools_layered` builds the materializer it returns. A factory rather than a flag so
-#: that a caller selects a *strategy by name* — :class:`_LayeredMaterializer` for a fresh target,
-#: :class:`PersistentMaterializer` for one that is reused — and so a caller with a third can pass it
-#: without this signature growing another boolean.
+#: How :func:`fs_tools_layered` constructs its materializer.
 type MaterializerFactory = Callable[[Sequence[FSBackend], GlobalExcludeArg], Materializer]
 
 
@@ -994,12 +960,10 @@ def _default_materializer(
 def persistent_materializer(
     backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
 ) -> Materializer:
-    """:data:`MaterializerFactory` for a reused target — pass to ``fs_tools_layered``.
+    """:data:`MaterializerFactory` for a reused target.
 
-    Reads the stack the way :class:`PersistentMaterializer` splits it: the **last** backend is the
-    base (the unchanging bulk, which in a read stack is the lowest-priority layer), and everything
-    above it is an overlay. A single-backend stack is all base and no overlay, which dumps once and
-    then does nothing — correct, and a sign the caller wanted the default materializer.
+    The last backend is the base (lowest priority in the read stack);
+    everything before it is an overlay.
     """
     *overlays, base = backends
     return PersistentMaterializer(base, overlays, global_exclude=global_exclude)
@@ -1034,14 +998,7 @@ def fs_tools_layered(
     priority and the global exclude.
 
     ``materializer`` selects the dump strategy. The default fills a fresh
-    directory. Pass :func:`persistent_materializer` for a target that is
-    reused between dumps — a warm build directory, say — where rewriting
-    an unchanged file costs a rebuild and where content the dump did not
-    put there has to survive it.
-
-    Both halves come out of one call over one backend stack on purpose:
-    the read tools and the materializer must not be able to disagree
-    about what the composite view contains.
+    directory; pass :func:`persistent_materializer` for a reused target.
     """
     # Single fold: tool-surface readability is "forbidden_read allows
     # AND not globally excluded". One predicate = no foot-gun about

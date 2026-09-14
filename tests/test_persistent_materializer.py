@@ -1,20 +1,4 @@
-"""Tests for ``PersistentMaterializer`` — the dump strategy for a target that is reused.
-
-The default materializer fills a fresh directory, so every dump writes every file. That is right
-for a temp dir and wrong once something else owns state in the target, which is what happens as
-soon as a build system runs there. Three properties follow, and each is tested here because each
-one is invisible until a real toolchain is pointed at the directory:
-
-* an unchanged file keeps its mtime, because a build that fingerprints on mtime rebuilds
-  everything downstream of a rewritten-but-identical file;
-* content the dump did not put there survives it, because a warm build directory accumulates
-  compiler output and package caches that are not view content;
-* a path an overlay stops serving is restored from the base if the base has one and removed if
-  not, because a stale file left behind still compiles and a deleted project file breaks a build
-  that was fine before anyone edited anything;
-* the base is read once however many dumps follow, because re-comparing a checkout that never
-  changes is the copy this class exists to avoid, moved rather than removed.
-"""
+"""Tests for ``PersistentMaterializer`` — dump into a reused target."""
 
 import asyncio
 import json
@@ -76,12 +60,7 @@ async def test_the_first_dump_fills_an_empty_target(tmp_path):
 
 
 async def test_an_unchanged_file_is_not_rewritten(tmp_path):
-    """The property the whole class exists for.
-
-    cargo fingerprints on mtime, so a rewritten-but-identical file is a change, and everything
-    downstream of it rebuilds. Over a dependency graph that is minutes per dump — the entire cost a
-    warm directory exists to avoid.
-    """
+    """Identical bytes must keep their mtime: many builds fingerprint on it."""
     base = _project(tmp_path / "src", a__rs="const A: u8 = 1;")
     target = tmp_path / "out"
     mat = PersistentMaterializer(base)
@@ -107,9 +86,7 @@ async def test_a_changed_file_is_rewritten(tmp_path):
 
 
 async def test_content_the_dump_did_not_write_survives(tmp_path):
-    """A persistent target accumulates build output, a package cache, lock files. None of it is
-    view content, and a dump that cleaned the directory would throw away exactly what reusing it
-    was for."""
+    """Compiler output and package caches are not view content."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
     mat = PersistentMaterializer(base)
@@ -129,8 +106,6 @@ async def test_content_the_dump_did_not_write_survives(tmp_path):
 
 
 async def test_an_overlay_that_invented_a_file_takes_it_away(tmp_path):
-    """A reverted edit that left its file behind would keep compiling — the stale copy is still on
-    disk and still valid Rust. Nothing else serves this path, so undo means removal."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     edits = DictBackend({"b/rs": "fn b() {}"})
     target = tmp_path / "out"
@@ -146,9 +121,6 @@ async def test_an_overlay_that_invented_a_file_takes_it_away(tmp_path):
 
 
 async def test_an_overlay_that_modified_a_file_restores_the_base(tmp_path):
-    """The other half of undo, and the one a flat stack cannot express. A file the project ships
-    and an overlay rewrote must come *back*, not vanish — deleting it would break a build that was
-    fine before anyone edited anything."""
     base = _project(tmp_path / "src", a__rs="pristine")
     edits = DictBackend({"a/rs": "munged"})
     target = tmp_path / "out"
@@ -163,9 +135,6 @@ async def test_an_overlay_that_modified_a_file_restores_the_base(tmp_path):
 
 
 async def test_the_base_is_read_once_however_many_dumps_follow(tmp_path):
-    """The third reason this class exists: a project checkout is the bulk of the view and none of
-    the churn, so comparing all of it on every dump is the copy the class avoids, moved rather than
-    removed."""
     base = _CountingBackend(_project(tmp_path / "src", a__rs="fn a() {}"))
     edits = DictBackend({"b/rs": "fn b() {}"})
     target = tmp_path / "out"
@@ -181,8 +150,7 @@ async def test_the_base_is_read_once_however_many_dumps_follow(tmp_path):
 
 
 async def test_removal_is_limited_to_what_this_materializer_wrote(tmp_path):
-    """The manifest is the boundary. A file that merely *looks* like view content — same name, put
-    there by something else — is not this materializer's to delete."""
+    """A file this materializer did not write is not its to delete."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
     mat = PersistentMaterializer(base)
@@ -196,9 +164,7 @@ async def test_removal_is_limited_to_what_this_materializer_wrote(tmp_path):
 
 
 async def test_a_corrupt_manifest_costs_a_bulk_copy_and_loses_nothing(tmp_path):
-    """Read as absent rather than as empty: an unreadable note must never be taken to mean "this
-    target has nothing in it", which would make the next dump skip the bulk copy that carries
-    binary content."""
+    """Unreadable is absent, not empty: empty would skip the base copy."""
     base = _project(tmp_path / "src", a__rs="fn a() {}")
     target = tmp_path / "out"
     mat = PersistentMaterializer(base)
@@ -212,9 +178,7 @@ async def test_a_corrupt_manifest_costs_a_bulk_copy_and_loses_nothing(tmp_path):
 
 
 async def test_binary_content_survives_the_first_dump(tmp_path):
-    """``get`` is text-only, so incremental dumps cannot carry bytes. The first dump delegates to
-    the backends' own ``dump_to``, which copies them — and since an edit layer's content is ``str``,
-    no edit can ever change a binary file, so writing it once is enough."""
+    """Overlays are text-only; binary files ride the base copy and are not rewritten."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xff")
@@ -249,8 +213,6 @@ async def test_globally_excluded_paths_are_never_written(tmp_path):
 
 
 async def test_the_factory_wires_it_through_fs_tools_layered(tmp_path):
-    """The read tools and the materializer come from one call over one stack, which is the property
-    that stops them disagreeing about what the view contains."""
     base = _project(tmp_path / "src", a__rs="pristine")
     edits = DictBackend({"a/rs": "edited"})
     target = tmp_path / "out"
@@ -258,17 +220,14 @@ async def test_the_factory_wires_it_through_fs_tools_layered(tmp_path):
     tools, mat = fs_tools_layered([edits, base], materializer=persistent_materializer)
     await mat.dump_to(target)
 
-    # The factory splits the read stack the way the class wants it: lowest priority is the base.
     assert isinstance(mat, PersistentMaterializer)
     get_file = next(t for t in tools if t.name == "get_file")
-    # What the agent reads and what the build compiles are the same text.
     assert "edited" in get_file.invoke({"path": "a/rs"})
     assert (target / "a/rs").read_text() == "edited"
 
 
 async def test_concurrent_readers_never_see_a_partial_file(tmp_path):
-    """Writes are atomic because a persistent target invites a build running against it while a
-    dump is in flight; a truncated source file is a compile error nobody can reproduce."""
+    """A reader mid-dump must see the old file or the new one, never a truncated one."""
     base = _project(tmp_path / "src", a__rs="x" * 100_000)
     edits = DictBackend()
     target = tmp_path / "out"
