@@ -16,6 +16,8 @@
 from typing_extensions import TypedDict
 from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Iterable, Sequence, ContextManager, Protocol, Iterator, Generic
 import asyncio
+import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -813,10 +815,198 @@ class _LayeredMaterializer:
         return None
 
 
+@dataclass
+class DictBackend:
+    """In-memory ``FSBackend``. Callers mutate :attr:`files` between dumps."""
+
+    files: dict[str, str] = field(default_factory=dict)
+
+    def get(self, path: str) -> str | None:
+        return self.files.get(path)
+
+    def list(self) -> Iterable[str]:
+        return list(self.files)
+
+    async def dump_to(
+        self,
+        target: pathlib.Path,
+        include_path: Callable[[str], bool] | None = None,
+    ) -> None:
+        def _write() -> None:
+            for path, content in self.files.items():
+                if include_path is not None and not include_path(path):
+                    continue
+                dest = target / path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
+        await asyncio.to_thread(_write)
+
+
+#: Overlay paths last written into a target. Stored in the target so a later
+#: process can tell that output apart from whatever else the directory holds.
+MATERIALIZED_MANIFEST = ".graphcore-materialized.json"
+
+
+class PersistentMaterializer:
+    """Writes a composite view into a directory that is reused between dumps.
+
+    A reused target already holds other state — compiler output, a package
+    cache — so a dump must not disturb files it did not write, and must not
+    rewrite an unchanged file (mtime is a fingerprint).
+
+    ``base`` is the unchanging bulk, copied once. ``overlays`` are
+    content-compared on every dump; a path an overlay drops is restored from
+    the base if ``base.get`` returns text, and unlinked otherwise. Binary
+    files ride the first copy; they cannot be restored (``get`` is
+    text-only), so an overlay that overwrote a binary path unlinks it on
+    drop.
+    """
+
+    def __init__(
+        self,
+        base: FSBackend,
+        overlays: Sequence[FSBackend] = (),
+        global_exclude: GlobalExcludeArg = None,
+    ) -> None:
+        self._base = base
+        self._overlays = list(overlays)
+        self._include: Callable[[str], bool] = _make_global_include_pred(global_exclude)
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        manifest = target / MATERIALIZED_MANIFEST
+        previous = self._read_manifest(manifest)
+        if previous is None:
+            await self._base.dump_to(target, include_path=self._include)
+            previous = set()
+
+        current: dict[str, str] = {}
+        for overlay in reversed(self._overlays):
+            for path in overlay.list():
+                if not self._include(path):
+                    continue
+                content = overlay.get(path)
+                if content is not None:
+                    current[path] = content
+
+        def _sync() -> None:
+            for path, content in current.items():
+                _write_if_changed(target / path, content)
+            for path in previous - current.keys():
+                dest = target / path
+                restored = self._base.get(path)
+                if restored is None:
+                    dest.unlink(missing_ok=True)
+                    _clear_scratch(dest)
+                else:
+                    _write_if_changed(dest, restored)
+
+        await asyncio.to_thread(_sync)
+        self._write_manifest(manifest, set(current))
+
+    def get(self, path: str) -> str | None:
+        if not self._include(path):
+            return None
+        for backend in (*self._overlays, self._base):
+            content = backend.get(path)
+            if content is not None:
+                return content
+        return None
+
+    @staticmethod
+    def _read_manifest(manifest: pathlib.Path) -> set[str] | None:
+        """Overlay paths from the last dump, or ``None`` if this target has never been dumped.
+
+        ``None`` and the empty set are different: empty means the base is
+        already in the target; ``None`` means copy it. An unreadable manifest
+        is treated as absent.
+        """
+        try:
+            loaded = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        paths = loaded.get("overlaid")
+        if not isinstance(paths, list):
+            return None
+        return {p for p in paths if isinstance(p, str)}
+
+    @staticmethod
+    def _write_manifest(manifest: pathlib.Path, overlaid: set[str]) -> None:
+        _atomic_write(manifest, json.dumps({"overlaid": sorted(overlaid)}, indent=2))
+
+
+def _scratch_prefix(path: pathlib.Path) -> str:
+    return f"{path.name}.tmp-"
+
+
+def _clear_scratch(path: pathlib.Path) -> None:
+    """Remove leftover ``{name}.tmp-*`` next to ``path`` (a killed dump, a new pid)."""
+    parent = path.parent
+    prefix = _scratch_prefix(path)
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if child.name.startswith(prefix):
+            child.unlink(missing_ok=True)
+
+
+def _atomic_write(path: pathlib.Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _clear_scratch(path)
+    tmp = path.with_name(f"{_scratch_prefix(path)}{os.getpid()}")
+    try:
+        tmp.write_text(content)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _write_if_changed(path: pathlib.Path, content: str) -> None:
+    """Skip the write when bytes match, so mtime is unchanged.
+
+    Atomic (tmp + ``os.replace``) so a concurrent reader sees either the
+    old file or the new one. Scratch from a killed dump is removed even
+    when the file itself does not need rewriting.
+    """
+    _clear_scratch(path)
+    try:
+        if path.read_text() == content:
+            return
+    except (OSError, ValueError):
+        pass
+    _atomic_write(path, content)
+
+
+#: How :func:`fs_tools_layered` constructs its materializer.
+type MaterializerFactory = Callable[[Sequence[FSBackend], GlobalExcludeArg], Materializer]
+
+
+def _default_materializer(
+    backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
+) -> Materializer:
+    return _LayeredMaterializer(backends, global_exclude=global_exclude)
+
+
+def persistent_materializer(
+    backends: Sequence[FSBackend], global_exclude: GlobalExcludeArg
+) -> Materializer:
+    """:data:`MaterializerFactory` for a reused target.
+
+    The last backend is the base (lowest priority in the read stack);
+    everything before it is an overlay.
+    """
+    *overlays, base = backends
+    return PersistentMaterializer(base, overlays, global_exclude=global_exclude)
+
+
 def fs_tools_layered(
     backends: Sequence[FSBackend],
     forbidden_read: GlobalExcludeArg = None,
     global_exclude: GlobalExcludeArg = None,
+    materializer: MaterializerFactory = _default_materializer,
 ) -> tuple[list[BaseTool], Materializer]:
     """Create stateless read-only filesystem tools over a layered backend stack.
 
@@ -839,6 +1029,9 @@ def fs_tools_layered(
     ``[get_file, list_files, grep_files]``; ``materializer`` dumps the
     composite view into a caller-provided directory, honoring layer
     priority and the global exclude.
+
+    ``materializer`` selects the dump strategy. The default fills a fresh
+    directory; pass :func:`persistent_materializer` for a reused target.
     """
     # Single fold: tool-surface readability is "forbidden_read allows
     # AND not globally excluded". One predicate = no foot-gun about
@@ -924,7 +1117,7 @@ def fs_tools_layered(
         )
 
     tools: list[BaseTool] = [get_file, list_files, grep_files]
-    return tools, _LayeredMaterializer(backend_list, global_exclude=global_exclude)
+    return tools, materializer(backend_list, global_exclude)
 
 
 def fs_tools(
