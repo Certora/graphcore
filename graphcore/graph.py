@@ -31,9 +31,9 @@ from langgraph.graph import StateGraph, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Checkpointer
 from langgraph._internal._typing import StateLike
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, interrupt, Send
 from langgraph.prebuilt import ToolNode
-from langgraph.prebuilt.tool_node import ToolInvocationError
+from langgraph.prebuilt.tool_node import ToolInvocationError, ToolCallWithContext
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, ValidationError
 from .utils import ainvoke, invoke, current_prompt_tokens, get_token_usage
@@ -361,6 +361,28 @@ def _default_conversation_node(state: MessagesState) -> dict[str, list[BaseMessa
     response = interrupt({"type": "conversation", "message": last})
     return {"messages": [HumanMessage(content=response)]}
 
+def _tools_join_node(state: MessagesState) -> None:
+    """Barrier after the per-tool-call tasks of a turn. Writes nothing; it exists so that the
+    post-tools routing runs once, against the merged state, rather than once per tool task."""
+    return None
+
+def dispatch_tool_calls(state: MessagesState, tools_node: str) -> list[Send]:
+    """One `Send` per tool call on the trailing AIMessage, in tool-call order, each carrying the
+    full state so `InjectedState` tools see the real graph state and the real turn."""
+    last = state["messages"][-1]
+    assert isinstance(last, AIMessage)
+    return [
+        Send(
+            tools_node,
+            ToolCallWithContext(
+                __type="tool_call_with_context",
+                tool_call=tc,
+                state=state,
+            ),
+        )
+        for tc in last.tool_calls
+    ]
+
 I = TypeVar("I", bound=FlowInput)
 O = TypeVar("O")
 
@@ -504,6 +526,7 @@ class _InitialFact(Protocol):
 
 INITIAL_NODE = "initial"
 TOOLS_NODE = "tools"
+TOOLS_JOIN_NODE = "tools_join"
 TOOL_RESULT_NODE = "tool_result"
 SUMMARIZE_NODE = "summarize"
 NO_TOOLS_NODE = "no_tools"
@@ -909,12 +932,26 @@ def _build_workflow(
             return "__end__"
         return "tool_result"
 
-    def ai_message_router(state: StateT) -> Literal["tools", "no_tools"]:
+    def ai_message_router(state: StateT) -> list[Send] | Literal["no_tools"]:
         m = state["messages"]
         last = m[-1]
         if not isinstance(last, AIMessage):
             raise ValueError("Routing is broken, have non-AI message at end of message")
-        return "tools" if last.tool_calls else "no_tools"
+        if not last.tool_calls:
+            return "no_tools"
+        return dispatch_tool_calls(state, TOOLS_NODE)
+
+    # LangGraph reads a conditional edge's state through the schema named by the router's
+    # first-parameter annotation, falling back to the source node's input schema. Off
+    # INITIAL_NODE that fallback is `input_type`, which would leave every state channel
+    # outside it out of the Send payload, and so out of what InjectedState tools see on the
+    # first turn. The state class is a runtime value here, so the annotation is assigned.
+    ai_message_router.__annotations__["state"] = state_class
+
+    # The router returns `Send`s, so LangGraph cannot infer the destinations from a Literal
+    # return type; without this map the "no_tools" label would be written to a nonexistent
+    # channel and silently dropped.
+    ai_router_targets = [TOOLS_NODE, NO_TOOLS_NODE]
 
     tool_schemas : list[BaseTool | dict] = []
     tool_impls : list[BaseTool] = []
@@ -955,14 +992,19 @@ def _build_workflow(
     builder.set_entry_point(INITIAL_NODE)
     builder.add_node(INITIAL_NODE, init_node, input_schema=input_type)
     builder.add_node(TOOLS_NODE, tool_node)
+    # Explicit schema: LangGraph would otherwise infer `MessagesState` from the join's
+    # annotation, and the routing hung off the join would then read only `messages`
+    # and never see `output_key`.
+    builder.add_node(TOOLS_JOIN_NODE, _tools_join_node, input_schema=state_class)
     builder.add_node(TOOL_RESULT_NODE, tool_result_node)
     if no_tools_fn is not None:
         builder.add_node(NO_TOOLS_NODE, no_tools_fn)
     else:
         builder.add_node(NO_TOOLS_NODE, _scolding_node)
 
-    builder.add_conditional_edges(INITIAL_NODE, ai_message_router)
-    builder.add_conditional_edges(TOOL_RESULT_NODE, ai_message_router)
+    builder.add_conditional_edges(INITIAL_NODE, ai_message_router, ai_router_targets)
+    builder.add_conditional_edges(TOOL_RESULT_NODE, ai_message_router, ai_router_targets)
+    builder.add_edge(TOOLS_NODE, TOOLS_JOIN_NODE)
     builder.add_edge(NO_TOOLS_NODE, TOOL_RESULT_NODE)
 
     if summarization is not None:
@@ -985,7 +1027,7 @@ def _build_workflow(
         )
         builder.add_node(SUMMARIZE_NODE, summarizer)
         builder.add_edge(SUMMARIZE_NODE, TOOL_RESULT_NODE)
-        builder.add_conditional_edges(TOOLS_NODE, routing)
+        builder.add_conditional_edges(TOOLS_JOIN_NODE, routing)
     else:
-        builder.add_conditional_edges(TOOLS_NODE, should_end)
+        builder.add_conditional_edges(TOOLS_JOIN_NODE, should_end)
     return builder, llm

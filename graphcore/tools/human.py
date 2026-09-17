@@ -1,4 +1,5 @@
-from typing import TypeVar, Callable, Literal, Annotated, get_args, get_origin, cast, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypeVar, Callable, Literal, Annotated, get_args, get_origin, cast, Any
 
 from pydantic import create_model, Field, BaseModel
 from pydantic.fields import FieldInfo
@@ -12,6 +13,38 @@ M = TypeVar("M")
 S = TypeVar("S")
 
 _injected_state_name = "graphcore_injected_state"
+
+
+if TYPE_CHECKING:
+    class QuestionId(str):
+        """The durable identity of a question put to a person: the asking tool
+        call's id. Nominally distinct from LangGraph's interrupt id, which names
+        the pending task rather than the question, so the two cannot be mixed
+        up in a resume map or an inbox. A plain ``str`` at runtime."""
+        ...
+else:
+    QuestionId = str
+
+
+@dataclass(frozen=True)
+class Question[T]:
+    """An interrupt payload addressed to a person, with the durable identity an
+    answer is keyed by. ``id`` survives a process restart and names the
+    ``ToolMessage`` that eventually consumes the answer. Handlers that answer
+    from outside the process route on ``id``; console handlers only ever see
+    ``payload``."""
+
+    id: QuestionId
+    payload: T
+
+
+def ask[T](question_id: QuestionId, payload: T) -> str:
+    """Put ``payload`` to a person and return their answer.
+
+    The typed face of ``interrupt`` for questions: an answer is always text,
+    whoever provides it (a console, a TUI, a mailbox filled from another
+    process), so this is the one place the untyped primitive is called."""
+    return cast(str, interrupt(Question(question_id, payload)))
 
 def _process_model_tydict(
     t: type[dict]
@@ -86,7 +119,7 @@ def human_interaction_tool(
             payload = t.model_validate(dict_args)
         else:
             payload = t(**dict_args)
-        response = interrupt(payload)
+        response = ask(QuestionId(kwargs["tool_call_id"]), payload)
         state_update = state_updater(kwargs[_injected_state_name], payload, response)
         response_update = {
             "messages": [

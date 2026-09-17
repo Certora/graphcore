@@ -14,7 +14,10 @@ from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Send
 from langgraph._internal._typing import StateLike
+
+from .graph import dispatch_tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -232,10 +235,12 @@ class InitializedScenario(Generic[STATE_TYPE]):
         async def agent(state: STATE_TYPE) -> dict[str, list[BaseMessage]]:
             return {"messages": [await llm.ainvoke(state["messages"])]}
 
-        def should_continue(state: dict) -> str:
+        # Same dispatch as the production graph: one task per tool call, full state along for
+        # the ride, so InjectedState tools behave here as they do there.
+        def should_continue(state: STATE_TYPE) -> list[Send] | str:
             last = state["messages"][-1]
             if getattr(last, "tool_calls", None):
-                return "tools"
+                return dispatch_tool_calls(state, "tools")
             return "__end__"
 
         context_type = self.context_record.ty if self.context_record else None
@@ -243,7 +248,7 @@ class InitializedScenario(Generic[STATE_TYPE]):
         graph.add_node("agent", agent)
         graph.add_node("tools", tool_node)
         graph.set_entry_point("agent")
-        graph.add_conditional_edges("agent", should_continue)
+        graph.add_conditional_edges("agent", should_continue, ["tools", "__end__"])
         graph.add_edge("tools", "agent")
 
         state_in : STATE_TYPE = cast(STATE_TYPE, {
