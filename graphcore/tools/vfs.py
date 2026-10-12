@@ -14,8 +14,9 @@
 #      along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing_extensions import TypedDict
-from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Iterable, Sequence, ContextManager, Protocol, Iterator, Generic
+from typing import NotRequired, TypeVar, Any, Annotated, Type, Callable, Iterable, Sequence, ContextManager, Protocol, Iterator, Generic, runtime_checkable
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -690,6 +691,26 @@ class FSBackend(Protocol):
         ...
 
 
+@runtime_checkable
+class SyncableBackend(FSBackend, Protocol):
+    """An :class:`FSBackend` that a :class:`PersistentMaterializer` can keep a reused target in
+    step with.
+
+    It adds two things ``FSBackend`` cannot give. ``get_bytes`` returns exact bytes, so binary
+    files and line endings survive both the copy and a restore. ``walk`` enumerates without
+    descending into an excluded directory, because a reused target often sits *inside* its own
+    base, and the base then holds the target's build output and package cache.
+    """
+
+    def walk(self, include_path: Callable[[str], bool]) -> Iterator[str]:
+        """Every file path for which ``include_path`` holds, never entering a directory whose own
+        path it rejects."""
+        ...
+
+    def get_bytes(self, path: str) -> bytes | None:
+        ...
+
+
 class Materializer(Protocol):
     """Writes a composite filesystem view into a real on-disk directory.
 
@@ -738,6 +759,25 @@ class DirBackend:
             return child.read_text()
         except Exception:
             return None
+
+    def get_bytes(self, path: str) -> bytes | None:
+        try:
+            return (self.root / path).read_bytes()
+        except OSError:
+            return None
+
+    def walk(self, include_path: Callable[[str], bool]) -> Iterator[str]:
+        """A symlink to a file is a file. A symlink to a directory is not descended into, which
+        keeps a link out of the root from pulling what it points at in."""
+        for directory, subdirs, names in os.walk(self.root):
+            here = pathlib.Path(directory)
+            relative = here.relative_to(self.root).as_posix()
+            prefix = "" if relative == "." else f"{relative}/"
+            subdirs[:] = [d for d in subdirs if include_path(f"{prefix}{d}")]
+            for name in names:
+                path = f"{prefix}{name}"
+                if include_path(path) and (here / name).is_file():
+                    yield path
 
     def list(self) -> Iterable[str]:
         if not self.cache_listing:
@@ -842,42 +882,94 @@ class DictBackend:
         await asyncio.to_thread(_write)
 
 
-#: Overlay paths last written into a target. Stored in the target so a later
+#: What the dumps into a target last wrote there. Stored in the target so a later
 #: process can tell that output apart from whatever else the directory holds.
 MATERIALIZED_MANIFEST = ".graphcore-materialized.json"
+
+
+@dataclass(frozen=True)
+class _Manifest:
+    #: Overlay paths from the last dump.
+    overlaid: frozenset[str]
+    #: Base paths from the last base sync, each mapped to the SHA-256 of the bytes it copied.
+    base: dict[str, str]
 
 
 class PersistentMaterializer:
     """Writes a composite view into a directory that is reused between dumps.
 
     A reused target already holds other state — compiler output, a package
-    cache — so a dump must not disturb files it did not write, and must not
-    rewrite an unchanged file (mtime is a fingerprint).
+    cache, a lock file the build amended — so a dump must not disturb files it
+    did not write, and must not rewrite an unchanged file (mtime is a
+    fingerprint).
 
-    ``base`` is the unchanging bulk, copied once. ``overlays`` are
-    content-compared on every dump; a path an overlay drops is restored from
-    the base if ``base.get`` returns text, and unlinked otherwise. Binary
-    files ride the first copy; they cannot be restored (``get`` is
-    text-only), so an overlay that overwrote a binary path unlinks it on
-    drop.
+    ``base`` is the bulk, synced into a target once per materializer (see
+    :meth:`sync_base`). ``overlays`` are content-compared on every dump; a path
+    an overlay drops is restored to the base's bytes, or unlinked if the base
+    has no such file.
     """
 
     def __init__(
         self,
-        base: FSBackend,
+        base: SyncableBackend,
         overlays: Sequence[FSBackend] = (),
         global_exclude: GlobalExcludeArg = None,
     ) -> None:
         self._base = base
         self._overlays = list(overlays)
         self._include: Callable[[str], bool] = _make_global_include_pred(global_exclude)
+        self._synced: set[pathlib.Path] = set()
 
-    async def dump_to(self, target: pathlib.Path) -> None:
+    async def sync_base(self, target: pathlib.Path) -> tuple[str, ...]:
+        """Bring ``target``'s copy of the base up to date, and return what a reused target had out
+        of date: the paths copied into it or removed from it. A target with no manifest returns
+        nothing, though everything is copied into it.
+
+        A base file is copied when its bytes differ from what the last sync copied, and removed when
+        the base no longer has it. Judged against that record rather than against the target's
+        file, so a file the consumer changed survives until the base changes it too.
+
+        A path the last dump overlaid is left as the overlay wrote it. The next dump decides it,
+        either rewriting the overlay's content or restoring the base's, and restoring it here first
+        would cost a rewrite whenever the overlay still serves it.
+        """
+        changed = await asyncio.to_thread(self._sync_base, target)
+        self._synced.add(target.resolve())
+        return changed
+
+    def _sync_base(self, target: pathlib.Path) -> tuple[str, ...]:
         manifest = target / MATERIALIZED_MANIFEST
         previous = self._read_manifest(manifest)
-        if previous is None:
-            await self._base.dump_to(target, include_path=self._include)
-            previous = set()
+        overlaid = previous.overlaid if previous is not None else frozenset()
+        copied = previous.base if previous is not None else {}
+        current: dict[str, str] = {}
+        changed: list[str] = []
+        for path in self._base.walk(self._include):
+            content = self._base.get_bytes(path)
+            if content is None:
+                continue
+            current[path] = hashlib.sha256(content).hexdigest()
+            dest = target / path
+            if path in overlaid or (copied.get(path) == current[path] and dest.exists()):
+                continue
+            if write_if_changed(dest, content):
+                changed.append(path)
+        for path in sorted(copied.keys() - current.keys() - overlaid):
+            dest = target / path
+            if dest.exists():
+                dest.unlink()
+                changed.append(path)
+            _clear_scratch(dest)
+        self._write_manifest(manifest, _Manifest(overlaid=overlaid, base=current))
+        return tuple(changed) if previous is not None else ()
+
+    async def dump_to(self, target: pathlib.Path) -> None:
+        if target.resolve() not in self._synced:
+            await self.sync_base(target)
+        manifest = target / MATERIALIZED_MANIFEST
+        previous = self._read_manifest(manifest)
+        overlaid = previous.overlaid if previous is not None else frozenset()
+        copied = previous.base if previous is not None else {}
 
         current: dict[str, str] = {}
         for overlay in reversed(self._overlays):
@@ -890,18 +982,18 @@ class PersistentMaterializer:
 
         def _sync() -> None:
             for path, content in current.items():
-                _write_if_changed(target / path, content)
-            for path in previous - current.keys():
+                write_if_changed(target / path, content.encode())
+            for path in overlaid - current.keys():
                 dest = target / path
-                restored = self._base.get(path)
+                restored = self._base.get_bytes(path)
                 if restored is None:
                     dest.unlink(missing_ok=True)
                     _clear_scratch(dest)
                 else:
-                    _write_if_changed(dest, restored)
+                    write_if_changed(dest, restored)
 
         await asyncio.to_thread(_sync)
-        self._write_manifest(manifest, set(current))
+        self._write_manifest(manifest, _Manifest(overlaid=frozenset(current), base=copied))
 
     def get(self, path: str) -> str | None:
         if not self._include(path):
@@ -913,12 +1005,15 @@ class PersistentMaterializer:
         return None
 
     @staticmethod
-    def _read_manifest(manifest: pathlib.Path) -> set[str] | None:
-        """Overlay paths from the last dump, or ``None`` if this target has never been dumped.
+    def _read_manifest(manifest: pathlib.Path) -> _Manifest | None:
+        """The manifest, or ``None`` if this target has never been dumped.
 
-        ``None`` and the empty set are different: empty means the base is
-        already in the target; ``None`` means copy it. An unreadable manifest
-        is treated as absent.
+        ``None`` and an empty manifest are different: empty means the base is
+        already in the target; ``None`` means nothing in the target can be
+        trusted to be the base's, so every file is content-compared. An
+        unreadable manifest is treated as absent. A manifest without a base
+        record is one whose base sync recorded nothing, which costs the same
+        content compare and keeps its overlay paths.
         """
         try:
             loaded = json.loads(manifest.read_text())
@@ -929,11 +1024,20 @@ class PersistentMaterializer:
         paths = loaded.get("overlaid")
         if not isinstance(paths, list):
             return None
-        return {p for p in paths if isinstance(p, str)}
+        base = loaded.get("base")
+        return _Manifest(
+            overlaid=frozenset(p for p in paths if isinstance(p, str)),
+            base={
+                p: digest
+                for p, digest in (base.items() if isinstance(base, dict) else ())
+                if isinstance(p, str) and isinstance(digest, str)
+            },
+        )
 
     @staticmethod
-    def _write_manifest(manifest: pathlib.Path, overlaid: set[str]) -> None:
-        _atomic_write(manifest, json.dumps({"overlaid": sorted(overlaid)}, indent=2))
+    def _write_manifest(manifest: pathlib.Path, written: _Manifest) -> None:
+        payload = {"overlaid": sorted(written.overlaid), "base": dict(sorted(written.base.items()))}
+        _atomic_write(manifest, json.dumps(payload, indent=2).encode())
 
 
 def _scratch_prefix(path: pathlib.Path) -> str:
@@ -953,19 +1057,20 @@ def _clear_scratch(path: pathlib.Path) -> None:
             child.unlink(missing_ok=True)
 
 
-def _atomic_write(path: pathlib.Path, content: str) -> None:
+def _atomic_write(path: pathlib.Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _clear_scratch(path)
     tmp = path.with_name(f"{_scratch_prefix(path)}{os.getpid()}")
     try:
-        tmp.write_text(content)
+        tmp.write_bytes(content)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 
 
-def _write_if_changed(path: pathlib.Path, content: str) -> None:
-    """Skip the write when bytes match, so mtime is unchanged.
+def write_if_changed(path: pathlib.Path, content: bytes) -> bool:
+    """Write ``content`` unless ``path`` already holds exactly those bytes, so an
+    unchanged file keeps its mtime. Returns whether it wrote.
 
     Atomic (tmp + ``os.replace``) so a concurrent reader sees either the
     old file or the new one. Scratch from a killed dump is removed even
@@ -973,11 +1078,12 @@ def _write_if_changed(path: pathlib.Path, content: str) -> None:
     """
     _clear_scratch(path)
     try:
-        if path.read_text() == content:
-            return
-    except (OSError, ValueError):
+        if path.read_bytes() == content:
+            return False
+    except OSError:
         pass
     _atomic_write(path, content)
+    return True
 
 
 #: How :func:`fs_tools_layered` constructs its materializer.
@@ -995,10 +1101,15 @@ def persistent_materializer(
 ) -> Materializer:
     """:data:`MaterializerFactory` for a reused target.
 
-    The last backend is the base (lowest priority in the read stack);
-    everything before it is an overlay.
+    The last backend is the base (lowest priority in the read stack), and must
+    be a :class:`SyncableBackend`; everything before it is an overlay.
     """
     *overlays, base = backends
+    if not isinstance(base, SyncableBackend):
+        raise TypeError(
+            "a persistent materializer's base must be a SyncableBackend such as DirBackend, "
+            f"not {type(base).__name__}"
+        )
     return PersistentMaterializer(base, overlays, global_exclude=global_exclude)
 
 
