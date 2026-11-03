@@ -6,7 +6,7 @@ import pytest
 
 from langgraph.graph import MessagesState
 
-from graphcore.tools.vfs import vfs_tools, VFSState, VFSToolConfig
+from graphcore.tools.vfs import vfs_tools, VFSState, VFSToolConfig, GREP_MAX_OUTPUT_CHARS
 from graphcore.testing import Scenario, tool_call_raw, ToolCallDict
 
 pytestmark = pytest.mark.asyncio
@@ -174,6 +174,16 @@ class TestGrepFiles:
             _grep("uint", matching_lines=True),
         ).run_last_single_tool(_GREP)
         assert "src/Foo.sol:2:" in resp
+
+    async def test_grep_matching_lines_output_is_bounded(self):
+        body = "\n".join(f"uint v{i};" for i in range(500))
+        resp = await _scenario({
+            f"lib/dep{n}/V.sol": body for n in range(500)
+        }).turn(
+            _grep("uint", matching_lines=True),
+        ).run_last_single_tool(_GREP)
+        assert len(resp) <= GREP_MAX_OUTPUT_CHARS + 300
+        assert "of 250000 matching lines" in resp.splitlines()[-1]
 
 
 # =========================================================================
