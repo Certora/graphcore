@@ -125,12 +125,9 @@ def _get_file(cont: str | None, range: FileRange | None) -> str:
 
 
 
-# Bounds on what one grep call returns. A tool result goes into the prompt
-# whole, and the next model call fails outright once the prompt passes the
-# model's context window. Code tokenizes at roughly 3-4 characters per token
-# (minified content at about 2), so the total bound keeps one result to a few
-# tens of thousands of tokens. The per-line bound exists because a single
-# matching line in a minified or generated file can be megabytes long.
+# Bounds on one grep result, which goes into the prompt whole: past the model's
+# context window the next call fails. 100k characters is a few tens of thousands
+# of tokens. One line of a minified or generated file can be megabytes long.
 GREP_MAX_OUTPUT_CHARS = 100_000
 GREP_MAX_LINE_CHARS = 500
 
