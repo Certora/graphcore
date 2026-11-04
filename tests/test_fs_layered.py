@@ -16,6 +16,7 @@ from typing import Callable, Iterable
 import pytest
 
 from graphcore.tools.vfs import (
+    GREP_MAX_OUTPUT_CHARS,
     DirBackend,
     _LayeredMaterializer,
     _make_global_include_pred,
@@ -274,6 +275,61 @@ class TestLayeredReads:
             "matching_lines": True,
         })
         assert "x.sol:2:" in resp
+
+
+# ---------------------------------------------------------------------------
+# fs_tools_layered — grep output bounds
+# ---------------------------------------------------------------------------
+
+
+class TestGrepOutputBounds:
+    pytestmark = pytest.mark.asyncio
+
+    async def test_many_matching_lines_are_cut_with_a_notice(self):
+        # 2,000 files of 200 matching lines each: about 20 MB if returned whole.
+        body = "\n".join(f"function f{i}() external {{}}" for i in range(200))
+        b = InMemoryBackend({f"lib/dep{n}/F.sol": body for n in range(2000)})
+        tools, _ = _tools_by_name([b])
+        resp = tools["grep_files"].invoke({
+            "search_string": "function",
+            "matching_lines": True,
+        })
+        assert len(resp) <= GREP_MAX_OUTPUT_CHARS + 300
+        assert "showing" in resp and "of 400000 matching lines" in resp
+        assert "match_in" in resp.splitlines()[-1]
+        # Every line before the notice is a complete ``file:lineno:line`` entry.
+        for entry in resp.splitlines()[:-1]:
+            assert entry.startswith("lib/dep") and "function f" in entry
+
+    async def test_long_matching_line_is_clipped(self):
+        b = InMemoryBackend({"dist/app.sol": "x" * 3_000_000 + "NEEDLE" + "y" * 10})
+        tools, _ = _tools_by_name([b])
+        resp = tools["grep_files"].invoke({
+            "search_string": "NEEDLE",
+            "matching_lines": True,
+        })
+        assert resp.startswith("dist/app.sol:1:")
+        assert len(resp) < 1_000
+        assert "line cut" in resp
+
+    async def test_many_matching_files_are_cut_with_a_notice(self):
+        b = InMemoryBackend({f"{'d' * 80}/f{n}.sol": "hit" for n in range(5000)})
+        tools, _ = _tools_by_name([b])
+        resp = tools["grep_files"].invoke({
+            "search_string": "hit",
+            "matching_lines": False,
+        })
+        assert len(resp) <= GREP_MAX_OUTPUT_CHARS + 300
+        assert "of 5000 matching files" in resp.splitlines()[-1]
+
+    async def test_output_under_the_bound_has_no_notice(self):
+        b = InMemoryBackend({"a.sol": "hit\nhit", "b.sol": "hit"})
+        tools, _ = _tools_by_name([b])
+        resp = tools["grep_files"].invoke({
+            "search_string": "hit",
+            "matching_lines": True,
+        })
+        assert resp == "a.sol:1:hit\na.sol:2:hit\nb.sol:1:hit"
 
 
 # ---------------------------------------------------------------------------

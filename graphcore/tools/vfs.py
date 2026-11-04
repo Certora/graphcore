@@ -125,6 +125,41 @@ def _get_file(cont: str | None, range: FileRange | None) -> str:
 
 
 
+# Bounds on one grep result, which goes into the prompt whole: past the model's
+# context window the next call fails. 100k characters is a few tens of thousands
+# of tokens. One line of a minified or generated file can be megabytes long.
+GREP_MAX_OUTPUT_CHARS = 100_000
+GREP_MAX_LINE_CHARS = 500
+
+
+def _clip_line(line: str) -> str:
+    if len(line) <= GREP_MAX_LINE_CHARS:
+        return line
+    rest = len(line) - GREP_MAX_LINE_CHARS
+    return f"{line[:GREP_MAX_LINE_CHARS]} [... line cut, {rest} more characters]"
+
+
+def _bounded_join(entries: list[str], unit: str) -> str:
+    """Join *entries* one per line, stopping before the total passes
+    :data:`GREP_MAX_OUTPUT_CHARS`. When entries are left out, a last line says
+    how many and tells the agent how to narrow the search."""
+    kept: list[str] = []
+    size = 0
+    for entry in entries:
+        # +1 for the newline that joins it to the previous entry.
+        if size + len(entry) + 1 > GREP_MAX_OUTPUT_CHARS:
+            break
+        kept.append(entry)
+        size += len(entry) + 1
+    if len(kept) == len(entries):
+        return "\n".join(kept)
+    kept.append(
+        f"[Output cut: showing {len(kept)} of {len(entries)} {unit}. "
+        "Use a more specific search_string, or restrict the search with match_in.]"
+    )
+    return "\n".join(kept)
+
+
 def _grep_impl(
     search_string: str,
     matching_lines: bool,
@@ -137,11 +172,15 @@ def _grep_impl(
 
     Args:
         search_string: Regex pattern to search for
+        matching_lines: If true, return matching lines; otherwise matching file names
         file_contents: Iterator of (filename, content) tuples
-        check_allowed: Filter function for allowed filenames
+        get_content: Reads a file's content by name, for the matching-lines pass
+        match_in: If set, only these paths are searched
 
     Returns:
-        Newline-separated list of matching filenames, or error message
+        Newline-separated matching file names or ``file:lineno:line`` entries,
+        bounded by :data:`GREP_MAX_OUTPUT_CHARS` and :data:`GREP_MAX_LINE_CHARS`,
+        or an error message
     """
     comp: re.Pattern
     try:
@@ -164,7 +203,7 @@ def _grep_impl(
             matches.append(k)
     
     if not matching_lines:
-        return "\n".join(matches)
+        return _bounded_join(matches, "matching files")
 
     matched_lines = []
 
@@ -174,9 +213,9 @@ def _grep_impl(
         cont = cont_s.splitlines()
         for (lno, l) in enumerate(cont, start=1):
             if comp.search(l):
-                matched_lines.append(f"{match_name}:{lno}:{l}")
+                matched_lines.append(f"{match_name}:{lno}:{_clip_line(l)}")
 
-    return "\n".join(matched_lines)
+    return _bounded_join(matched_lines, "matching lines")
 
 
 
@@ -260,6 +299,11 @@ class _GrepFileSchemaBase(BaseModel):
     In both output modes, empty lines should be ignored.
 
     In both modes, the paths to search can be restricted with `match_in`.
+
+    The output is bounded. A very long matching line is cut, and when there are more
+    matches than fit, the output stops and its last line says how many were left out.
+    If that happens, use a more specific search string or restrict the search with
+    `match_in`.
 
     IMPORTANT: This tool searches file *contents*, NOT their names. DO NOT use this tool to search for files
     whose name make a regex, it will not work.
