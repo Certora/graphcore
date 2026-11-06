@@ -227,13 +227,12 @@ def _stitch_sync_impl(
         state: IN
     ) -> OUT:
         thunk = pure(state)
-        d = next(thunk)
-        res = llm_impl(d)
-        try:
-            thunk.send(res)
-            assert False, "did not terminate"
-        except StopIteration as e:
-            return e.value
+        request = next(thunk)
+        while True:
+            try:
+                request = thunk.send(llm_impl(request))
+            except StopIteration as e:
+                return e.value
     return impl
 
 def _stitch_async_impl(
@@ -244,13 +243,12 @@ def _stitch_async_impl(
         state: IN
     ) -> OUT:
         thunk = pure(state)
-        d = next(thunk)
-        res = await llm_impl(d)
-        try:
-            thunk.send(res)
-            assert False, "did not terminate"
-        except StopIteration as e:
-            return e.value
+        request = next(thunk)
+        while True:
+            try:
+                request = thunk.send(await llm_impl(request))
+            except StopIteration as e:
+                return e.value
     return impl
 
 type MonitorReturn = tuple[list[AnyMessage] | None, dict[str, Any] | None]
@@ -313,6 +311,16 @@ class _ResultFact(Protocol):
     ) -> AnyChatNodeFunction[StateT]:
         ...
 
+#: Appended to every summarization request. The summarizer calls the agent's own tool-bound model
+#: so the request shares the agent's cached prefix, and after a long run of tool calls the model
+#: answers a bare summarization request by calling a tool (``memory``, to save its notes) or, with
+#: no tools bound, by ending its turn with no text at all.
+_SUMMARY_IN_PLAIN_TEXT = "\n\nDo not call any tool in this turn. Reply with the summary as plain text.\n"
+
+#: Requests per compaction before the summarizer gives up and keeps the history as it is.
+SUMMARY_ATTEMPTS = 2
+
+
 def _get_summarizer_pure(
     system_prompt: MessagePayloadType,
     initial_prompt: MessagePayloadType,
@@ -323,15 +331,29 @@ def _get_summarizer_pure(
         config = context
         assert config is not None
 
-        summary_prompt = config.get_summarization_prompt(state)
+        summary_prompt = config.get_summarization_prompt(state) + _SUMMARY_IN_PLAIN_TEXT
 
         messages = state["messages"].copy()
         assert messages, "summarizer invoked with empty message history"
+        request = messages + [HumanMessage(content=summary_prompt, display_tag="summarization")]
 
         try:
-            msg = yield(messages + [HumanMessage(content=summary_prompt, display_tag="summarization")])
-            assert isinstance(msg, AIMessage)
-            summary = msg.text
+            summary: str | None = None
+            for attempt in range(1, SUMMARY_ATTEMPTS + 1):
+                msg = yield request
+                assert isinstance(msg, AIMessage)
+                if msg.text.strip():
+                    summary = msg.text
+                    break
+                logger.warning(
+                    f"Summarization attempt {attempt}/{SUMMARY_ATTEMPTS} returned no text "
+                    f"(stop_reason={msg.response_metadata.get('stop_reason')}, "
+                    f"tool calls={[c['name'] for c in msg.tool_calls]}, "
+                    f"output tokens={(msg.usage_metadata or {}).get('output_tokens')})"
+                )
+            if summary is None:
+                logger.warning("Keeping the uncompacted history; the next turn will summarize again")
+                return {}
             resume_message = config.get_resume_prompt(state, summary)
             config.on_summary(state, summary, resume_message)
             # Handle initial_prompt as either str or dict (with cache_control)
@@ -345,6 +367,7 @@ def _get_summarizer_pure(
                 ]
             }
         except Exception:
+            logger.exception("Summarization failed; keeping the uncompacted history")
             return {}
     return to_return
 
@@ -1022,7 +1045,7 @@ def _build_workflow(
                 return "tool_result"
 
         summarizer = summary_fact(
-            unbound_llm, sys_prompt, initial_prompt, state_class, summarization.config
+            llm, sys_prompt, initial_prompt, state_class, summarization.config
         )
         builder.add_node(SUMMARIZE_NODE, summarizer)
         builder.add_edge(SUMMARIZE_NODE, TOOL_RESULT_NODE)
