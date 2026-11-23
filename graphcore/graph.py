@@ -432,8 +432,9 @@ def _get_initial_pure(
         state: I
     ) -> PureFunctionGenerator[O]:
         """
-        Any fields in state that are not specified by the FlowInput bound (i.e.,
-        are not front_matter or input) are automatically added to the main state.
+        Builds the opening messages only. The graph's other input fields already reached the
+        main state when the graph was invoked, so they are not written again: a second write
+        would run a field's reducer twice and double an appending one.
         """
         initial_messages : List[AnyMessage] = [
             SystemMessage(
@@ -464,12 +465,7 @@ def _get_initial_pure(
         initial_messages.append(
             cast(AnyMessage, res)
         )
-        to_ret : dict[str, Any] = {"messages": initial_messages}
-        for (k, v) in state.items():
-            if k == "front_matter" or k == "input":
-                continue
-            to_ret[k] = v
-        return cast(O, to_ret)
+        return cast(O, {"messages": initial_messages})
     return impl
 
 
